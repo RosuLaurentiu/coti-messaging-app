@@ -304,6 +304,12 @@ body {
   background: #111b27;
 }
 
+.message-time {
+  margin-top: 6px;
+  font-size: 0.72rem;
+  color: #9eb0c4;
+}
+
 .message-row.outgoing .message-bubble {
   background: #1d2d42;
   border-color: #5179ad;

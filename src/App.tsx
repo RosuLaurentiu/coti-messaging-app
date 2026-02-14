@@ -11,6 +11,14 @@ declare global {
   }
 }
 
+type Eip1193Provider = {
+  request: (args: { method: string; params?: unknown[] | object }) => Promise<unknown>;
+  connect?: () => Promise<unknown>;
+  on?: (event: string, listener: (...args: unknown[]) => void) => void;
+  removeListener?: (event: string, listener: (...args: unknown[]) => void) => void;
+  disconnect?: () => Promise<void>;
+};
+
 type Contact = {
   address: string;
   name?: string;
@@ -20,6 +28,7 @@ type ChatMessage = {
   id: string;
   direction: 'incoming' | 'outgoing';
   text: string;
+  timestamp?: number;
 };
 
 type HistoryEntry = {
@@ -29,10 +38,12 @@ type HistoryEntry = {
   text: string;
   blockNumber: number;
   logIndex: number;
+  timestamp?: number;
 };
 
 const CONTACTS_STORAGE_KEY = 'coti-chat-contacts';
 const ACTIVE_CONTACT_STORAGE_KEY = 'coti-chat-active-contact';
+const AUTO_SYNC_INTERVAL_MS = 30000;
 
 const COTI_NETWORK = {
   chainIdHex: '0x282b34',
@@ -55,7 +66,11 @@ const MEMO_CONTRACT_ABI = [
 ] as const;
 
 type CotiEthersModule = typeof import('@coti-io/coti-ethers');
+type WalletConnectProviderModule = typeof import('@walletconnect/ethereum-provider');
 let cotiEthersModulePromise: Promise<CotiEthersModule> | null = null;
+let walletConnectModulePromise: Promise<WalletConnectProviderModule> | null = null;
+
+const WALLETCONNECT_PROJECT_ID = import.meta.env.VITE_WALLETCONNECT_PROJECT_ID as string | undefined;
 
 const loadCotiEthersModule = (): Promise<CotiEthersModule> => {
   if (!cotiEthersModulePromise) {
@@ -63,6 +78,14 @@ const loadCotiEthersModule = (): Promise<CotiEthersModule> => {
   }
 
   return cotiEthersModulePromise;
+};
+
+const loadWalletConnectProviderModule = (): Promise<WalletConnectProviderModule> => {
+  if (!walletConnectModulePromise) {
+    walletConnectModulePromise = import('@walletconnect/ethereum-provider');
+  }
+
+  return walletConnectModulePromise;
 };
 
 const shortenAddress = (address: string): string => `${address.slice(0, 6)}...${address.slice(-4)}`;
@@ -78,7 +101,7 @@ const normalizeChainId = (chainId: string | number): number => {
   return chainId.startsWith('0x') ? parseInt(chainId, 16) : Number(chainId);
 };
 
-const createCotiBrowserProvider = async (ethereum: NonNullable<Window['ethereum']>): Promise<BrowserProvider> => {
+const createCotiBrowserProvider = async (ethereum: Eip1193Provider): Promise<BrowserProvider> => {
   const cotiEthers = await loadCotiEthersModule();
   return new cotiEthers.BrowserProvider(ethereum, {
     name: COTI_NETWORK.chainName,
@@ -112,6 +135,20 @@ const decodeMemoPlaintext = (raw: string): string => {
   } catch {
     return raw;
   }
+};
+
+const formatMessageTimestamp = (timestamp?: number): string => {
+  if (!timestamp || !Number.isFinite(timestamp)) {
+    return '';
+  }
+
+  return new Date(timestamp * 1000).toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit'
+  });
 };
 
 const toBigIntArray = (value: unknown): bigint[] => {
@@ -256,6 +293,8 @@ export default function App() {
   const [walletAddress, setWalletAddress] = useState<string>('');
   const [chainId, setChainId] = useState<number | null>(null);
   const [status, setStatus] = useState<string>('Disconnected');
+  const [connectionMethod, setConnectionMethod] = useState<'metamask' | 'walletconnect' | null>(null);
+  const [connectingMethod, setConnectingMethod] = useState<'metamask' | 'walletconnect' | null>(null);
   const [onboardStatus, setOnboardStatus] = useState<string>('Not onboarded');
   const [sessionOnboardInfo, setSessionOnboardInfo] = useState<Record<string, OnboardInfo>>({});
   const [messageInput, setMessageInput] = useState('');
@@ -263,7 +302,14 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const [syncingHistory, setSyncingHistory] = useState(false);
   const [error, setError] = useState<string>('');
+  const [activeProvider, setActiveProvider] = useState<Eip1193Provider | null>(null);
+  const activeProviderRef = useRef<Eip1193Provider | null>(null);
+  const chatMessagesRef = useRef<HTMLDivElement | null>(null);
   const signerCacheRef = useRef<Record<string, JsonRpcSigner>>({});
+  const sendingRef = useRef(false);
+  const syncingHistoryRef = useRef(false);
+  const lastSyncedBlockRef = useRef<Record<string, number>>({});
+  const syncConversationHistoryRef = useRef<() => Promise<void>>(async () => {});
 
   const isConnected = useMemo(() => walletAddress.length > 0, [walletAddress]);
   const onCotiNetwork = useMemo(() => chainId === COTI_NETWORK.chainIdDecimal, [chainId]);
@@ -273,10 +319,71 @@ export default function App() {
     }
     return messagesByContact[activeContact.toLowerCase()] ?? [];
   }, [activeContact, messagesByContact]);
+  const sortedContacts = useMemo(() => {
+    const withIndex = contacts.map((contact, index) => {
+      const key = contact.address.toLowerCase();
+      const messages = messagesByContact[key] ?? [];
+      const latestTimestamp = messages.reduce((max, message) => {
+        const value = message.timestamp ?? 0;
+        return value > max ? value : max;
+      }, 0);
+
+      return {
+        contact,
+        index,
+        messageCount: messages.length,
+        latestTimestamp
+      };
+    });
+
+    withIndex.sort((a, b) => {
+      if (a.latestTimestamp !== b.latestTimestamp) {
+        return b.latestTimestamp - a.latestTimestamp;
+      }
+
+      if (a.messageCount !== b.messageCount) {
+        return b.messageCount - a.messageCount;
+      }
+
+      return a.index - b.index;
+    });
+
+    return withIndex.map((item) => item.contact);
+  }, [contacts, messagesByContact]);
   const activeContactMeta = useMemo(
     () => contacts.find((contact) => contact.address.toLowerCase() === activeContact?.toLowerCase()),
     [contacts, activeContact]
   );
+  const hasAesReady = useMemo(
+    () => (walletAddress ? Boolean(sessionOnboardInfo[walletAddress.toLowerCase()]?.aesKey) : false),
+    [walletAddress, sessionOnboardInfo]
+  );
+
+  const setConnectedProvider = (provider: Eip1193Provider | null) => {
+    activeProviderRef.current = provider;
+    setActiveProvider(provider);
+  };
+
+  const getConnectedProvider = (): Eip1193Provider | null => {
+    if (connectionMethod === 'walletconnect') {
+      return activeProviderRef.current ?? activeProvider ?? null;
+    }
+
+    if (connectionMethod === 'metamask') {
+      return activeProviderRef.current ?? activeProvider ?? window.ethereum ?? null;
+    }
+
+    return activeProviderRef.current ?? activeProvider ?? null;
+  };
+
+  const scrollChatToBottom = () => {
+    const container = chatMessagesRef.current;
+    if (!container) {
+      return;
+    }
+
+    container.scrollTop = container.scrollHeight;
+  };
 
   const handleAddContact = (event: FormEvent) => {
     event.preventDefault();
@@ -360,13 +467,13 @@ export default function App() {
     }
   };
 
-  const ensureCotiNetwork = async () => {
-    if (!window.ethereum) {
-      throw new Error('MetaMask is not installed.');
+  const ensureCotiNetwork = async (provider: Eip1193Provider) => {
+    if (!provider) {
+      throw new Error('Wallet provider is not available.');
     }
 
     try {
-      await window.ethereum.request({
+      await provider.request({
         method: 'wallet_switchEthereumChain',
         params: [{ chainId: COTI_NETWORK.chainIdHex }]
       });
@@ -374,7 +481,7 @@ export default function App() {
       const errorWithCode = switchError as { code?: number; message?: string };
 
       if (errorWithCode.code === 4902) {
-        await window.ethereum.request({
+        await provider.request({
           method: 'wallet_addEthereumChain',
           params: [
             {
@@ -386,7 +493,7 @@ export default function App() {
             }
           ]
         });
-        await window.ethereum.request({
+        await provider.request({
           method: 'wallet_switchEthereumChain',
           params: [{ chainId: COTI_NETWORK.chainIdHex }]
         });
@@ -396,17 +503,18 @@ export default function App() {
     }
   };
 
-  const refreshWalletState = async () => {
-    if (!window.ethereum) {
+  const refreshWalletState = async (providerOverride?: Eip1193Provider | null) => {
+    const provider = providerOverride ?? getConnectedProvider();
+    if (!provider) {
       return;
     }
 
-    const accounts = (await window.ethereum.request({ method: 'eth_accounts' })) as string[];
+    const accounts = (await provider.request({ method: 'eth_accounts' })) as string[];
     const selected = accounts[0] ?? '';
     setWalletAddress(selected);
 
     if (selected) {
-      const currentChain = (await window.ethereum.request({ method: 'eth_chainId' })) as string | number;
+      const currentChain = (await provider.request({ method: 'eth_chainId' })) as string | number;
       setChainId(normalizeChainId(currentChain));
       setStatus('Connected');
     } else {
@@ -415,18 +523,18 @@ export default function App() {
     }
   };
 
-  const onboardAddressAes = async (address: string) => {
-    if (!window.ethereum) {
-      throw new Error('MetaMask not detected. Please install MetaMask.');
+  const onboardAddressAes = async (address: string, provider: Eip1193Provider) => {
+    if (!provider) {
+      throw new Error('Wallet provider is not available.');
     }
 
     setOnboardStatus('Onboarding...');
-    await ensureCotiNetwork();
+    await ensureCotiNetwork(provider);
 
-    const provider = await createCotiBrowserProvider(window.ethereum);
+    const browserProvider = await createCotiBrowserProvider(provider);
 
     const cacheKey = address.toLowerCase();
-    const signer = await provider.getSigner(address, sessionOnboardInfo[cacheKey]);
+    const signer = await browserProvider.getSigner(address, sessionOnboardInfo[cacheKey]);
     signerCacheRef.current[cacheKey] = signer;
 
     await signer.generateOrRecoverAes();
@@ -447,44 +555,110 @@ export default function App() {
 
   const connectAndOnboard = async () => {
     setError('');
+    setConnectingMethod('metamask');
 
-    if (!window.ethereum) {
+    const provider = window.ethereum;
+    if (!provider) {
       setError('MetaMask not detected. Please install MetaMask.');
+      setConnectingMethod(null);
       return;
     }
 
     try {
       setStatus('Connecting...');
-      const accounts = walletAddress
-        ? ((await window.ethereum.request({ method: 'eth_accounts' })) as string[])
-        : ((await window.ethereum.request({ method: 'eth_requestAccounts' })) as string[]);
+      const accounts = (await provider.request({ method: 'eth_requestAccounts' })) as string[];
       const selected = accounts[0] ?? '';
 
       if (!selected) {
         throw new Error('No wallet account selected.');
       }
 
+      setConnectedProvider(provider);
+      setConnectionMethod('metamask');
       setWalletAddress(selected);
 
-      await onboardAddressAes(selected);
-      const currentChain = (await window.ethereum.request({ method: 'eth_chainId' })) as string | number;
+      await onboardAddressAes(selected, provider);
+      const currentChain = (await provider.request({ method: 'eth_chainId' })) as string | number;
       setChainId(normalizeChainId(currentChain));
-      setStatus('Connected');
+      setStatus('Connected (MetaMask)');
       await syncConversationHistory();
     } catch (connectionError) {
       const message = connectionError instanceof Error ? connectionError.message : 'Failed to connect wallet.';
       setError(message);
       setStatus('Disconnected');
       setOnboardStatus('Not onboarded');
+    } finally {
+      setConnectingMethod(null);
+    }
+  };
+
+  const connectWalletConnect = async () => {
+    setError('');
+    setConnectingMethod('walletconnect');
+
+    if (!WALLETCONNECT_PROJECT_ID) {
+      setError('Missing VITE_WALLETCONNECT_PROJECT_ID in .env.');
+      setConnectingMethod(null);
+      return;
+    }
+
+    let walletConnectProvider: Eip1193Provider | null = null;
+
+    try {
+      setStatus('Connecting WalletConnect...');
+      const walletConnectModule = await loadWalletConnectProviderModule();
+      const wcProvider = await walletConnectModule.EthereumProvider.init({
+        projectId: WALLETCONNECT_PROJECT_ID,
+        chains: [COTI_NETWORK.chainIdDecimal],
+        optionalChains: [COTI_NETWORK.chainIdDecimal],
+        showQrModal: true,
+        rpcMap: {
+          [COTI_NETWORK.chainIdDecimal]: COTI_NETWORK.rpcUrl
+        }
+      });
+
+      walletConnectProvider = wcProvider as unknown as Eip1193Provider;
+      await walletConnectProvider.connect?.();
+      const accounts = (await walletConnectProvider.request({ method: 'eth_accounts' })) as string[];
+      const selected = accounts[0] ?? '';
+
+      if (!selected) {
+        throw new Error('No wallet account selected via WalletConnect.');
+      }
+
+      setConnectedProvider(walletConnectProvider);
+      setConnectionMethod('walletconnect');
+      setWalletAddress(selected);
+
+      await onboardAddressAes(selected, walletConnectProvider);
+      const currentChain = (await walletConnectProvider.request({ method: 'eth_chainId' })) as string | number;
+      setChainId(normalizeChainId(currentChain));
+      setStatus('Connected (WalletConnect)');
+      await syncConversationHistory();
+    } catch (connectionError) {
+      try {
+        await walletConnectProvider?.disconnect?.();
+      } catch {
+      }
+      const message = connectionError instanceof Error ? connectionError.message : 'Failed to connect WalletConnect.';
+      setError(message);
+      setStatus('Disconnected');
+      setOnboardStatus('Not onboarded');
+      setConnectedProvider(null);
+      setConnectionMethod(null);
+    } finally {
+      setConnectingMethod(null);
     }
   };
 
   const disconnectWallet = async () => {
     setError('');
 
+    const provider = getConnectedProvider();
+
     try {
-      if (window.ethereum) {
-        await window.ethereum.request({
+      if (connectionMethod === 'metamask' && provider) {
+        await provider.request({
           method: 'wallet_revokePermissions',
           params: [{ eth_accounts: {} }]
         });
@@ -492,17 +666,27 @@ export default function App() {
     } catch {
     }
 
+    try {
+      if (connectionMethod === 'walletconnect') {
+        await provider?.disconnect?.();
+      }
+    } catch {
+    }
+
     setWalletAddress('');
     setChainId(null);
     setStatus('Disconnected');
+    setConnectionMethod(null);
     setOnboardStatus('Not onboarded');
     setSessionOnboardInfo({});
+    setConnectedProvider(null);
     signerCacheRef.current = {};
   };
 
   const getMemoSigner = async () => {
-    if (!window.ethereum) {
-      throw new Error('MetaMask not detected. Please install MetaMask.');
+    const provider = getConnectedProvider();
+    if (!provider) {
+      throw new Error('Wallet provider not detected. Connect with MetaMask or WalletConnect.');
     }
 
     if (!walletAddress) {
@@ -517,20 +701,27 @@ export default function App() {
 
     let signer = signerCacheRef.current[cacheKey];
     if (!signer) {
-      const provider = await createCotiBrowserProvider(window.ethereum);
-      signer = await provider.getSigner(walletAddress, sessionOnboardInfo[cacheKey]);
+      const browserProvider = await createCotiBrowserProvider(provider);
+      signer = await browserProvider.getSigner(walletAddress, sessionOnboardInfo[cacheKey]);
       signerCacheRef.current[cacheKey] = signer;
     }
 
-    const onboardInfo = signer.getUserOnboardInfo();
+    let onboardInfo = signer.getUserOnboardInfo();
     if (!onboardInfo?.aesKey) {
-      throw new Error('AES key unavailable in this session. Use Connect + Sign AES.');
+      await signer.generateOrRecoverAes();
+      onboardInfo = signer.getUserOnboardInfo();
+    }
+
+    if (!onboardInfo?.aesKey) {
+      throw new Error('AES key unavailable in this session. Please sign to enable encryption.');
     }
 
     setSessionOnboardInfo((previous) => ({
       ...previous,
       [cacheKey]: mergeOnboardInfo(previous[cacheKey], onboardInfo)
     }));
+
+    setOnboardStatus('AES key ready');
 
     return { signer, cacheKey };
   };
@@ -542,23 +733,51 @@ export default function App() {
       return;
     }
 
-    if (syncingHistory) {
+    if (syncingHistoryRef.current) {
       return;
     }
 
     try {
+      syncingHistoryRef.current = true;
       setSyncingHistory(true);
       const { signer, cacheKey } = await getMemoSigner();
       const cotiEthers = await loadCotiEthersModule();
       const contract = new cotiEthers.Contract(MEMO_CONTRACT_ADDRESS, MEMO_CONTRACT_ABI, signer);
+      const latestBlock = await signer.provider.getBlockNumber();
+
+      const walletKey = walletAddress.toLowerCase();
+      const lastSyncedBlock = lastSyncedBlockRef.current[walletKey];
+      const fromBlock = typeof lastSyncedBlock === 'number' ? lastSyncedBlock + 1 : 0;
+
+      if (fromBlock > latestBlock) {
+        return;
+      }
 
       const incomingFilter = contract.filters.MemoSubmitted(walletAddress, null);
       const outgoingFilter = contract.filters.MemoSubmitted(null, walletAddress);
 
       const [incomingLogs, outgoingLogs] = await Promise.all([
-        contract.queryFilter(incomingFilter, 0, 'latest'),
-        contract.queryFilter(outgoingFilter, 0, 'latest')
+        contract.queryFilter(incomingFilter, fromBlock, latestBlock),
+        contract.queryFilter(outgoingFilter, fromBlock, latestBlock)
       ]);
+
+      const blockNumbers = new Set<number>();
+      for (const log of incomingLogs) {
+        blockNumbers.add(log.blockNumber);
+      }
+      for (const log of outgoingLogs) {
+        blockNumbers.add(log.blockNumber);
+      }
+
+      const blockTimestampMap = new Map<number, number>();
+      await Promise.all(
+        Array.from(blockNumbers).map(async (blockNumber) => {
+          const block = await signer.provider.getBlock(blockNumber);
+          if (block?.timestamp) {
+            blockTimestampMap.set(blockNumber, Number(block.timestamp));
+          }
+        })
+      );
 
       const discoveredContacts = new Set<string>();
       const entries: HistoryEntry[] = [];
@@ -590,7 +809,8 @@ export default function App() {
           direction: 'incoming',
           text: messageText,
           blockNumber: log.blockNumber,
-          logIndex: log.index
+          logIndex: log.index,
+          timestamp: blockTimestampMap.get(log.blockNumber)
         });
       }
 
@@ -621,7 +841,8 @@ export default function App() {
           direction: 'outgoing',
           text: messageText,
           blockNumber: log.blockNumber,
-          logIndex: log.index
+          logIndex: log.index,
+          timestamp: blockTimestampMap.get(log.blockNumber)
         });
       }
 
@@ -632,21 +853,35 @@ export default function App() {
         return a.logIndex - b.logIndex;
       });
 
-      const grouped: Record<string, ChatMessage[]> = {};
-      for (const entry of entries) {
-        const key = entry.contact.toLowerCase();
-        if (!grouped[key]) {
-          grouped[key] = [];
+      setMessagesByContact((previous) => {
+        if (entries.length === 0) {
+          return previous;
         }
-        grouped[key].push({
-          id: entry.id,
-          direction: entry.direction,
-          text: entry.text
-        });
-      }
 
-      setMessagesByContact(grouped);
+        const next: Record<string, ChatMessage[]> = { ...previous };
+        for (const entry of entries) {
+          const key = entry.contact.toLowerCase();
+          const existing = next[key] ?? [];
+
+          if (existing.some((message) => message.id === entry.id)) {
+            continue;
+          }
+
+          next[key] = [
+            ...existing,
+            {
+              id: entry.id,
+              direction: entry.direction,
+              text: entry.text,
+              timestamp: entry.timestamp
+            }
+          ];
+        }
+
+        return next;
+      });
       setContacts((previous) => mergeUniqueContacts(previous, Array.from(discoveredContacts)));
+      lastSyncedBlockRef.current[walletKey] = latestBlock;
 
       if (!activeContact && discoveredContacts.size > 0) {
         setActiveContact(Array.from(discoveredContacts)[0]);
@@ -661,14 +896,19 @@ export default function App() {
       const message = syncError instanceof Error ? syncError.message : 'Failed to sync history.';
       setError(message);
     } finally {
+      syncingHistoryRef.current = false;
       setSyncingHistory(false);
     }
   };
 
+  useEffect(() => {
+    syncConversationHistoryRef.current = syncConversationHistory;
+  }, [syncConversationHistory]);
+
   const sendMessage = async () => {
     setError('');
 
-    if (sending) {
+    if (sendingRef.current) {
       return;
     }
 
@@ -684,6 +924,7 @@ export default function App() {
     }
 
     try {
+      sendingRef.current = true;
       setSending(true);
 
       const { signer, cacheKey } = await getMemoSigner();
@@ -718,27 +959,13 @@ export default function App() {
         [cacheKey]: mergeOnboardInfo(previous[cacheKey], nextOnboardInfo)
       }));
 
-      setMessagesByContact((previous) => {
-        const key = activeContact.toLowerCase();
-        const current = previous[key] ?? [];
-        return {
-          ...previous,
-          [key]: [
-            ...current,
-            {
-              id: `${Date.now()}-out`,
-              direction: 'outgoing',
-              text: plainText
-            }
-          ]
-        };
-      });
-
       setMessageInput('');
+      await syncConversationHistory();
     } catch (sendError) {
       const message = sendError instanceof Error ? sendError.message : 'Failed to send message.';
       setError(message);
     } finally {
+      sendingRef.current = false;
       setSending(false);
     }
   };
@@ -801,17 +1028,89 @@ export default function App() {
   }, [activeContact]);
 
   useEffect(() => {
+    requestAnimationFrame(() => {
+      scrollChatToBottom();
+    });
+  }, [activeContact, activeMessages.length]);
+
+  useEffect(() => {
     if (!walletAddress) {
       setMessagesByContact({});
     }
   }, [walletAddress]);
 
   useEffect(() => {
-    refreshWalletState().catch(() => {
+    if (!walletAddress || chainId !== COTI_NETWORK.chainIdDecimal) {
+      return;
+    }
+
+    if (!hasAesReady) {
+      return;
+    }
+
+    let cancelled = false;
+    let unsubscribe: (() => void) | null = null;
+    const intervalId = window.setInterval(() => {
+      syncConversationHistoryRef.current().catch(() => {});
+    }, AUTO_SYNC_INTERVAL_MS);
+
+    const setupRealtimeSubscription = async () => {
+      try {
+        if (cancelled) {
+          return;
+        }
+
+        const { signer } = await getMemoSigner();
+        if (cancelled) {
+          return;
+        }
+
+        const cotiEthers = await loadCotiEthersModule();
+        const contract = new cotiEthers.Contract(MEMO_CONTRACT_ADDRESS, MEMO_CONTRACT_ABI, signer);
+
+        const incomingFilter = contract.filters.MemoSubmitted(walletAddress, null);
+        const outgoingFilter = contract.filters.MemoSubmitted(null, walletAddress);
+        const handleMemoSubmitted = () => {
+          if (!cancelled) {
+            syncConversationHistoryRef.current().catch(() => {});
+          }
+        };
+
+        contract.on(incomingFilter, handleMemoSubmitted);
+        contract.on(outgoingFilter, handleMemoSubmitted);
+
+        if (cancelled) {
+          contract.off(incomingFilter, handleMemoSubmitted);
+          contract.off(outgoingFilter, handleMemoSubmitted);
+          return;
+        }
+
+        unsubscribe = () => {
+          contract.off(incomingFilter, handleMemoSubmitted);
+          contract.off(outgoingFilter, handleMemoSubmitted);
+        };
+      } catch {
+      }
+    };
+
+    syncConversationHistoryRef.current().catch(() => {});
+    setupRealtimeSubscription().catch(() => {});
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+      unsubscribe?.();
+    };
+  }, [walletAddress, chainId, hasAesReady]);
+
+  useEffect(() => {
+    const provider = getConnectedProvider();
+
+    refreshWalletState(provider).catch(() => {
       setError('Unable to read wallet state.');
     });
 
-    if (!window.ethereum?.on || !window.ethereum?.removeListener) {
+    if (!provider?.on || !provider?.removeListener) {
       return;
     }
 
@@ -831,25 +1130,51 @@ export default function App() {
       }
     };
 
-    window.ethereum.on('accountsChanged', handleAccountsChanged);
-    window.ethereum.on('chainChanged', handleChainChanged);
+    provider.on('accountsChanged', handleAccountsChanged);
+    provider.on('chainChanged', handleChainChanged);
 
     return () => {
-      window.ethereum?.removeListener?.('accountsChanged', handleAccountsChanged);
-      window.ethereum?.removeListener?.('chainChanged', handleChainChanged);
+      provider.removeListener?.('accountsChanged', handleAccountsChanged);
+      provider.removeListener?.('chainChanged', handleChainChanged);
     };
-  }, []);
+  }, [activeProvider, connectionMethod]);
 
   return (
     <div className="app-root">
       <aside className="sidebar">
         <h1 className="title">COTI Chat</h1>
 
-        <button className="connect-btn" onClick={connectAndOnboard} type="button">
-          {!isConnected ? 'Connect + Sign AES' : onboardStatus === 'AES key ready' ? 'Wallet + AES Ready' : 'Sign AES Key'}
+        <button
+          className="connect-btn"
+          onClick={connectAndOnboard}
+          type="button"
+          disabled={connectingMethod !== null || (isConnected && connectionMethod === 'walletconnect')}
+        >
+          {connectingMethod === 'metamask'
+            ? 'Connecting MetaMask...'
+            : !isConnected || connectionMethod !== 'metamask'
+            ? 'Connect MetaMask + Sign AES'
+            : onboardStatus === 'AES key ready'
+              ? 'MetaMask + AES Ready'
+              : 'Sign AES Key'}
         </button>
 
-        <button className="connect-btn" onClick={disconnectWallet} type="button" disabled={!isConnected}>
+        <button
+          className="connect-btn"
+          onClick={connectWalletConnect}
+          type="button"
+          disabled={connectingMethod !== null || (isConnected && connectionMethod === 'metamask')}
+        >
+          {connectingMethod === 'walletconnect'
+            ? 'Connecting WalletConnect...'
+            : !isConnected || connectionMethod !== 'walletconnect'
+            ? 'Connect WalletConnect + Sign AES'
+            : onboardStatus === 'AES key ready'
+              ? 'WalletConnect + AES Ready'
+              : 'Sign AES Key'}
+        </button>
+
+        <button className="connect-btn" onClick={disconnectWallet} type="button" disabled={!isConnected || connectingMethod !== null}>
           Disconnect
         </button>
 
@@ -889,7 +1214,7 @@ export default function App() {
         </form>
 
         <ul className="contacts-list">
-          {contacts.map((contact) => {
+          {sortedContacts.map((contact) => {
             const isActive = activeContact?.toLowerCase() === contact.address.toLowerCase();
             const isEditing = editingContactAddress?.toLowerCase() === contact.address.toLowerCase();
             return (
@@ -985,7 +1310,7 @@ export default function App() {
               </button>
             </div>
 
-            <div className="chat-messages">
+            <div className="chat-messages" ref={chatMessagesRef}>
               {activeMessages.length === 0 ? (
                 <p className="chat-empty">No messages yet.</p>
               ) : (
@@ -994,7 +1319,10 @@ export default function App() {
                     key={message.id}
                     className={message.direction === 'outgoing' ? 'message-row outgoing' : 'message-row incoming'}
                   >
-                    <div className="message-bubble">{message.text}</div>
+                    <div className="message-bubble">
+                      <div>{message.text}</div>
+                      {message.timestamp ? <div className="message-time">{formatMessageTimestamp(message.timestamp)}</div> : null}
+                    </div>
                   </div>
                 ))
               )}
