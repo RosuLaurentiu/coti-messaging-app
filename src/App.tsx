@@ -59,8 +59,8 @@ const COTI_NETWORK = {
   blockExplorerUrl: 'https://mainnet.cotiscan.io'
 };
 
-const MEMO_CONTRACT_ADDRESS = '0x81DEfBfba1cdc5AF972566342F4935853E02923d';
-const MEMO_CONTRACT_ABI = [
+const CHAT_CONTRACT_ADDRESS = '0x81DEfBfba1cdc5AF972566342F4935853E02923d';
+const CHAT_CONTRACT_ABI = [
   'function submit(address recipient, ((uint256[] value), bytes[] signature) memo) payable',
   'function feeAmount() view returns (uint256)',
   'event MessageSubmitted(address indexed recipient, address indexed from, ((uint256[] value) ciphertext, (uint256[] value) userCiphertext) messageForRecipient, ((uint256[] value) ciphertext, (uint256[] value) userCiphertext) messageForSender)'
@@ -743,7 +743,7 @@ export default function App() {
       setSyncingHistory(true);
       const { signer, cacheKey } = await getMemoSigner();
       const cotiEthers = await loadCotiEthersModule();
-      const contract = new cotiEthers.Contract(MEMO_CONTRACT_ADDRESS, MEMO_CONTRACT_ABI, signer);
+      const contract = new cotiEthers.Contract(CHAT_CONTRACT_ADDRESS, CHAT_CONTRACT_ABI, signer);
       const latestBlock = await signer.provider.getBlockNumber();
 
       const walletKey = walletAddress.toLowerCase();
@@ -930,14 +930,14 @@ export default function App() {
 
       const { signer, cacheKey } = await getMemoSigner();
       const cotiEthers = await loadCotiEthersModule();
-      const memoContractInterface = new cotiEthers.Interface(MEMO_CONTRACT_ABI);
+      const memoContractInterface = new cotiEthers.Interface(CHAT_CONTRACT_ABI);
       const selector = memoContractInterface.getFunction('submit')?.selector;
       if (!selector) {
         throw new Error('Unable to resolve submit selector.');
       }
 
       const encodedMemo = encodeMemoPlaintext(plainText);
-      const encryptedMemo = await signer.encryptValue(encodedMemo, MEMO_CONTRACT_ADDRESS, selector);
+      const encryptedMemo = await signer.encryptValue(encodedMemo, CHAT_CONTRACT_ADDRESS, selector);
       if (
         typeof encryptedMemo !== 'object' ||
         encryptedMemo === null ||
@@ -949,7 +949,7 @@ export default function App() {
         throw new Error('Encrypted memo format mismatch for submit().');
       }
 
-      const contract = new cotiEthers.Contract(MEMO_CONTRACT_ADDRESS, MEMO_CONTRACT_ABI, signer);
+      const contract = new cotiEthers.Contract(CHAT_CONTRACT_ADDRESS, CHAT_CONTRACT_ABI, signer);
       const requiredFee = (await contract.feeAmount()) as bigint;
       const memoTuple = [[encryptedMemo.ciphertext.value], encryptedMemo.signature] as const;
       const tx = await contract.submit(activeContact, memoTuple, { value: requiredFee });
@@ -1068,7 +1068,7 @@ export default function App() {
         }
 
         const cotiEthers = await loadCotiEthersModule();
-        const contract = new cotiEthers.Contract(MEMO_CONTRACT_ADDRESS, MEMO_CONTRACT_ABI, signer);
+        const contract = new cotiEthers.Contract(CHAT_CONTRACT_ADDRESS, CHAT_CONTRACT_ABI, signer);
 
         const incomingFilter = contract.filters.MessageSubmitted(walletAddress, null);
         const outgoingFilter = contract.filters.MessageSubmitted(null, walletAddress);
