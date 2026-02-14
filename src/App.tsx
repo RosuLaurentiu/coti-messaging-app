@@ -631,15 +631,10 @@ const trimReplyPreview = (text: string): string => {
   return `${singleLine.slice(0, MAX_REPLY_PREVIEW_LENGTH - 1)}…`;
 };
 
-const buildMessageWithReplyPayload = (plainText: string, replyToText?: string, replyToMessageId?: string): string => {
+const buildMessageWithReplyPayload = (plainText: string, replyToText?: string, _replyToMessageId?: string): string => {
   const preview = trimReplyPreview((replyToText ?? '').replace(/\]/g, ''));
   if (!preview) {
     return plainText;
-  }
-
-  const normalizedReplyId = (replyToMessageId ?? '').replace(/[^a-zA-Z0-9\-]/g, '').trim();
-  if (normalizedReplyId) {
-    return `${REPLY_METADATA_PREFIX}${normalizedReplyId}|${preview}] ${plainText}`;
   }
 
   return `${REPLY_METADATA_PREFIX}${preview}] ${plainText}`;
@@ -655,10 +650,11 @@ const parseMessageReplyPayload = (text: string): {
     if (metadataEnd > REPLY_METADATA_PREFIX.length) {
       const metadataChunk = text.slice(REPLY_METADATA_PREFIX.length, metadataEnd);
       const separatorIndex = metadataChunk.indexOf('|');
-      const rawReplyId = separatorIndex > 0 ? metadataChunk.slice(0, separatorIndex).trim() : '';
-      const rawPreview = separatorIndex > 0 ? metadataChunk.slice(separatorIndex + 1) : metadataChunk;
+      const hasLegacyIdChunk = separatorIndex > 0;
+      const rawReplyId = hasLegacyIdChunk ? metadataChunk.slice(0, separatorIndex).trim() : '';
+      const rawPreview = hasLegacyIdChunk ? metadataChunk.slice(separatorIndex + 1) : metadataChunk;
       const previewChunk = trimReplyPreview(rawPreview);
-      const replyToMessageId = /^[a-zA-Z0-9\-]+$/.test(rawReplyId) ? rawReplyId : undefined;
+      const replyToMessageId = hasLegacyIdChunk && /^[a-zA-Z0-9\-]+$/.test(rawReplyId) ? rawReplyId : undefined;
       const remainingRaw = text.slice(metadataEnd + 1);
       const remaining = remainingRaw.startsWith(' ') ? remainingRaw.slice(1) : remainingRaw;
 
