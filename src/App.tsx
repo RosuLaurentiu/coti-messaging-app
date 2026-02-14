@@ -28,6 +28,8 @@ type ChatMessage = {
   id: string;
   direction: 'incoming' | 'outgoing';
   text: string;
+  replyToMessageId?: string;
+  replyToText?: string;
   timestamp?: number;
 };
 
@@ -36,6 +38,8 @@ type HistoryEntry = {
   contact: string;
   direction: 'incoming' | 'outgoing';
   text: string;
+  replyToMessageId?: string;
+  replyToText?: string;
   blockNumber: number;
   logIndex: number;
   timestamp?: number;
@@ -52,8 +56,12 @@ const PROFILE_STORAGE_KEY = 'coti-chat-profile';
 const PROFILE_SHARED_STORAGE_KEY = 'coti-chat-profile-shared';
 const AUTO_SYNC_INTERVAL_MS = 30000;
 const NICKNAME_DELIMITER = '\u001f';
+const REPLY_DELIMITER = '\u001e';
+const PROFILE_METADATA_PREFIX = '[nick:';
+const REPLY_METADATA_PREFIX = '[reply:';
 const LEGACY_PROFILE_PREFIX = '[[coti-profile:v1]]';
 const LEGACY_PROFILE_PLAIN_PREFIX = '[[coti-nick:v1]]';
+const MAX_REPLY_PREVIEW_LENGTH = 120;
 const COTI_WEI = 10n ** 18n;
 const MIN_BURNER_TOP_UP_WEI = 1_000_000_000_000_000n;
 
@@ -82,6 +90,7 @@ type UserProfile = {
 type BurnerInitMode = 'generate' | 'import' | 'stored';
 type SignerSource = 'burner' | 'metamask';
 type BurnerPinMode = 'set' | 'unlock';
+type BurnerInitResult = 'connected' | 'needs-funding' | 'failed';
 
 type PendingBurnerInit = {
   mode: BurnerInitMode;
@@ -600,15 +609,101 @@ const loadSharedNicknameContacts = (walletAddress?: string | null): Record<strin
 const buildMessageWithProfilePayload = (plainText: string, nickname: string, shouldShare: boolean): string => {
   const normalizedNickname = nickname
     .replace(/\u001f/g, '')
+    .replace(/\]/g, '')
     .trim();
   if (!shouldShare || !normalizedNickname) {
     return plainText;
   }
 
-  return `${NICKNAME_DELIMITER}${normalizedNickname}${NICKNAME_DELIMITER}: ${plainText}`;
+  return `${PROFILE_METADATA_PREFIX}${normalizedNickname}] ${plainText}`;
+};
+
+const trimReplyPreview = (text: string): string => {
+  const singleLine = text.replace(/\s+/g, ' ').trim();
+  if (!singleLine) {
+    return '';
+  }
+
+  if (singleLine.length <= MAX_REPLY_PREVIEW_LENGTH) {
+    return singleLine;
+  }
+
+  return `${singleLine.slice(0, MAX_REPLY_PREVIEW_LENGTH - 1)}…`;
+};
+
+const buildMessageWithReplyPayload = (plainText: string, replyToText?: string, replyToMessageId?: string): string => {
+  const preview = trimReplyPreview((replyToText ?? '').replace(/\]/g, ''));
+  if (!preview) {
+    return plainText;
+  }
+
+  const normalizedReplyId = (replyToMessageId ?? '').replace(/[^a-zA-Z0-9\-]/g, '').trim();
+  if (normalizedReplyId) {
+    return `${REPLY_METADATA_PREFIX}${normalizedReplyId}|${preview}] ${plainText}`;
+  }
+
+  return `${REPLY_METADATA_PREFIX}${preview}] ${plainText}`;
+};
+
+const parseMessageReplyPayload = (text: string): {
+  cleanText: string;
+  replyToText?: string;
+  replyToMessageId?: string;
+} => {
+  if (text.startsWith(REPLY_METADATA_PREFIX)) {
+    const metadataEnd = text.indexOf(']', REPLY_METADATA_PREFIX.length);
+    if (metadataEnd > REPLY_METADATA_PREFIX.length) {
+      const metadataChunk = text.slice(REPLY_METADATA_PREFIX.length, metadataEnd);
+      const separatorIndex = metadataChunk.indexOf('|');
+      const rawReplyId = separatorIndex > 0 ? metadataChunk.slice(0, separatorIndex).trim() : '';
+      const rawPreview = separatorIndex > 0 ? metadataChunk.slice(separatorIndex + 1) : metadataChunk;
+      const previewChunk = trimReplyPreview(rawPreview);
+      const replyToMessageId = /^[a-zA-Z0-9\-]+$/.test(rawReplyId) ? rawReplyId : undefined;
+      const remainingRaw = text.slice(metadataEnd + 1);
+      const remaining = remainingRaw.startsWith(' ') ? remainingRaw.slice(1) : remainingRaw;
+
+      return {
+        cleanText: remaining,
+        replyToText: previewChunk || undefined,
+        replyToMessageId
+      };
+    }
+  }
+
+  if (!text.startsWith(REPLY_DELIMITER)) {
+    return { cleanText: text };
+  }
+
+  const delimiterEnd = text.indexOf(REPLY_DELIMITER, REPLY_DELIMITER.length);
+  if (delimiterEnd < 0) {
+    return { cleanText: text };
+  }
+
+  const previewChunk = trimReplyPreview(text.slice(REPLY_DELIMITER.length, delimiterEnd));
+  const remainingRaw = text.slice(delimiterEnd + REPLY_DELIMITER.length);
+  const remaining = remainingRaw.startsWith(': ') ? remainingRaw.slice(2) : remainingRaw;
+
+  return {
+    cleanText: remaining,
+    replyToText: previewChunk || undefined
+  };
 };
 
 const parseMessageProfilePayload = (text: string): { cleanText: string; nickname?: string } => {
+  if (text.startsWith(PROFILE_METADATA_PREFIX)) {
+    const metadataEnd = text.indexOf(']', PROFILE_METADATA_PREFIX.length);
+    if (metadataEnd > PROFILE_METADATA_PREFIX.length) {
+      const nicknameChunk = text.slice(PROFILE_METADATA_PREFIX.length, metadataEnd).trim();
+      const nickname = normalizeContactName(nicknameChunk)?.slice(0, 42);
+      const remainingRaw = text.slice(metadataEnd + 1);
+      const remaining = remainingRaw.startsWith(' ') ? remainingRaw.slice(1) : remainingRaw;
+      return {
+        cleanText: remaining,
+        nickname
+      };
+    }
+  }
+
   if (text.startsWith(NICKNAME_DELIMITER)) {
     const delimiterEnd = text.indexOf(NICKNAME_DELIMITER, NICKNAME_DELIMITER.length);
     if (delimiterEnd < 0) {
@@ -695,6 +790,8 @@ export default function App() {
   const [messagesByContact, setMessagesByContact] = useState<Record<string, ChatMessage[]>>({});
   const [sending, setSending] = useState(false);
   const [syncingHistory, setSyncingHistory] = useState(false);
+  const [replyingToMessage, setReplyingToMessage] = useState<ChatMessage | null>(null);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   const [topUpAmountWei, setTopUpAmountWei] = useState<bigint | null>(null);
   const [requiredFeeWei, setRequiredFeeWei] = useState<bigint | null>(null);
   const [burnerBalanceWei, setBurnerBalanceWei] = useState<bigint | null>(null);
@@ -708,6 +805,8 @@ export default function App() {
   const burnerRecordRef = useRef<BurnerWalletRecord | null>(null);
   const burnerPinRef = useRef<string>('');
   const chatMessagesRef = useRef<HTMLDivElement | null>(null);
+  const messageElementRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const highlightTimeoutRef = useRef<number | null>(null);
   const signerCacheRef = useRef<Record<string, JsonRpcSigner>>({});
   const sendingRef = useRef(false);
   const syncingHistoryRef = useRef(false);
@@ -847,7 +946,7 @@ export default function App() {
     mode: BurnerInitMode,
     seedOrPrivateKey?: string,
     pin?: string
-  ): Promise<boolean> => {
+  ): Promise<BurnerInitResult> => {
     setError('');
     setInitializingBurner(true);
     setBurnerNeedsFunding(false);
@@ -879,6 +978,10 @@ export default function App() {
       setWalletAddress(burnerWallet.address);
       setChainId(COTI_NETWORK.chainIdDecimal);
       setStatus('Connecting burner wallet...');
+      setActiveSignerSource('burner');
+      setConnectionMethod(null);
+      setConnectedProvider(null);
+      setBurnerImportInput('');
 
       if (burnerRecord.mnemonic) {
         setBurnerMnemonicBackup(burnerRecord.mnemonic);
@@ -886,6 +989,14 @@ export default function App() {
       } else {
         setBurnerMnemonicBackup('');
         setShowBurnerMnemonic(false);
+      }
+
+      const burnerBalance = (await rpcProvider.getBalance(burnerWallet.address)) as bigint;
+      if (burnerBalance <= 0n) {
+        setBurnerNeedsFunding(true);
+        setStatus('Burner wallet created. Fund it, then connect burner wallet.');
+        setOnboardStatus('Funding required');
+        return 'needs-funding';
       }
 
       const cacheKey = burnerWallet.address.toLowerCase();
@@ -908,23 +1019,20 @@ export default function App() {
       }));
       setOnboardStatus('AES key ready');
       setStatus('Connected (Burner)');
-      setActiveSignerSource('burner');
-      setConnectionMethod(null);
-      setConnectedProvider(null);
-      setBurnerImportInput('');
       await syncConversationHistoryRef.current();
-      return true;
+      return 'connected';
     } catch (burnerError) {
       const message = burnerError instanceof Error ? burnerError.message : 'Failed to initialize burner wallet.';
       if (message.includes('Account balance is 0 so user cannot be onboarded')) {
         setBurnerNeedsFunding(true);
         setStatus('Burner needs funding');
+        return 'needs-funding';
       } else {
         setStatus('Disconnected');
       }
       setError(message);
       setOnboardStatus('Not onboarded');
-      return false;
+      return 'failed';
     } finally {
       setInitializingBurner(false);
     }
@@ -1013,8 +1121,8 @@ export default function App() {
       }
     }
 
-    const connected = await initializeBurnerWallet(pending.mode, pending.seedOrPrivateKey, pin);
-    if (connected) {
+    const initResult = await initializeBurnerWallet(pending.mode, pending.seedOrPrivateKey, pin);
+    if (initResult === 'connected' || initResult === 'needs-funding') {
       setShowBurnerPinModal(false);
       setPendingBurnerInit(null);
       setBurnerPinInput('');
@@ -1024,7 +1132,7 @@ export default function App() {
         setShowBurnerImportModal(false);
       }
 
-      if (burnerPinMode === 'unlock' && pin.length < BURNER_PIN_MIN_LENGTH) {
+      if (initResult === 'connected' && burnerPinMode === 'unlock' && pin.length < BURNER_PIN_MIN_LENGTH) {
         setStatus(`Connected. Please update PIN to at least ${BURNER_PIN_MIN_LENGTH} digits.`);
         setPendingBurnerInit(null);
         setBurnerPinMode('set');
@@ -1117,6 +1225,40 @@ export default function App() {
     }
 
     container.scrollTop = container.scrollHeight;
+  };
+
+  const jumpToReferencedMessage = (replyToMessageId?: string, replyToText?: string) => {
+    if (!activeContact) {
+      return;
+    }
+
+    let targetId = replyToMessageId;
+    if (!targetId && replyToText) {
+      const targetPreview = trimReplyPreview(replyToText);
+      const matched = activeMessages.find((message) => trimReplyPreview(message.text) === targetPreview);
+      targetId = matched?.id;
+    }
+
+    if (!targetId) {
+      return;
+    }
+
+    const targetElement = messageElementRefs.current[targetId];
+    if (!targetElement) {
+      return;
+    }
+
+    targetElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    setHighlightedMessageId(targetId);
+
+    if (highlightTimeoutRef.current !== null) {
+      window.clearTimeout(highlightTimeoutRef.current);
+    }
+
+    highlightTimeoutRef.current = window.setTimeout(() => {
+      setHighlightedMessageId((previous) => (previous === targetId ? null : previous));
+      highlightTimeoutRef.current = null;
+    }, 1800);
   };
 
   const handleAddContact = (event: FormEvent) => {
@@ -1509,12 +1651,17 @@ export default function App() {
 
         const userCiphertext = extractUserCiphertext(args?.messageForRecipient);
         let messageText = '(Unable to decrypt message)';
+        let replyToMessageId: string | undefined;
+        let replyToText: string | undefined;
         if (userCiphertext && userCiphertext.value.length > 0) {
           try {
             const decrypted = await signer.decryptValue(userCiphertext as never);
             const raw = typeof decrypted === 'string' ? decrypted : decrypted.toString();
             const parsed = parseMessageProfilePayload(decodeMemoPlaintext(raw));
-            messageText = parsed.cleanText;
+            const replyParsed = parseMessageReplyPayload(parsed.cleanText);
+            messageText = replyParsed.cleanText;
+            replyToMessageId = replyParsed.replyToMessageId;
+            replyToText = replyParsed.replyToText;
             if (parsed.nickname) {
               discoveredNicknames.set(from.toLowerCase(), parsed.nickname);
             }
@@ -1528,6 +1675,8 @@ export default function App() {
           contact: from,
           direction: 'incoming',
           text: messageText,
+          replyToMessageId,
+          replyToText,
           blockNumber: log.blockNumber,
           logIndex: log.index,
           timestamp: blockTimestampMap.get(log.blockNumber)
@@ -1545,12 +1694,17 @@ export default function App() {
 
         const userCiphertext = extractUserCiphertext(args?.messageForSender);
         let messageText = '(Unable to decrypt message)';
+        let replyToMessageId: string | undefined;
+        let replyToText: string | undefined;
         if (userCiphertext && userCiphertext.value.length > 0) {
           try {
             const decrypted = await signer.decryptValue(userCiphertext as never);
             const raw = typeof decrypted === 'string' ? decrypted : decrypted.toString();
             const parsed = parseMessageProfilePayload(decodeMemoPlaintext(raw));
-            messageText = parsed.cleanText;
+            const replyParsed = parseMessageReplyPayload(parsed.cleanText);
+            messageText = replyParsed.cleanText;
+            replyToMessageId = replyParsed.replyToMessageId;
+            replyToText = replyParsed.replyToText;
           } catch {
             messageText = '(Unable to decrypt message)';
           }
@@ -1561,6 +1715,8 @@ export default function App() {
           contact: recipient,
           direction: 'outgoing',
           text: messageText,
+          replyToMessageId,
+          replyToText,
           blockNumber: log.blockNumber,
           logIndex: log.index,
           timestamp: blockTimestampMap.get(log.blockNumber)
@@ -1602,6 +1758,8 @@ export default function App() {
               id: entry.id,
               direction: entry.direction,
               text: entry.text,
+              replyToMessageId: entry.replyToMessageId,
+              replyToText: entry.replyToText,
               timestamp: entry.timestamp
             }
           ];
@@ -1691,6 +1849,11 @@ export default function App() {
 
       const contactKey = activeContact.toLowerCase();
       const shouldShareProfile = Boolean(myNickname.trim()) && !sharedNicknameContacts[contactKey];
+      const plainTextWithReply = buildMessageWithReplyPayload(
+        plainText,
+        replyingToMessage?.text,
+        replyingToMessage?.id
+      );
       const sendEncryptedMemo = async (textToSend: string): Promise<void> => {
         const encodedMemo = encodeMemoPlaintext(textToSend);
         const encryptedMemo = await signer.encryptValue(encodedMemo, CHAT_CONTRACT_ADDRESS, selector);
@@ -1712,11 +1875,11 @@ export default function App() {
 
       let sentWithProfile = false;
       if (shouldShareProfile) {
-        const plainTextWithProfile = buildMessageWithProfilePayload(plainText, myNickname, true);
+        const plainTextWithProfile = buildMessageWithProfilePayload(plainTextWithReply, myNickname, true);
         await sendEncryptedMemo(plainTextWithProfile);
         sentWithProfile = true;
       } else {
-        await sendEncryptedMemo(plainText);
+        await sendEncryptedMemo(plainTextWithReply);
       }
 
       const nextOnboardInfo = signer.getUserOnboardInfo();
@@ -1733,6 +1896,7 @@ export default function App() {
       }
 
       setMessageInput('');
+      setReplyingToMessage(null);
       await syncConversationHistory();
       if (activeSignerSource === 'burner') {
         setTopUpMetricsNonce((previous) => previous + 1);
@@ -1836,7 +2000,17 @@ export default function App() {
 
   useEffect(() => {
     setMessageInput('');
+    setReplyingToMessage(null);
+    setHighlightedMessageId(null);
   }, [activeContact]);
+
+  useEffect(() => {
+    return () => {
+      if (highlightTimeoutRef.current !== null) {
+        window.clearTimeout(highlightTimeoutRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     requestAnimationFrame(() => {
@@ -2316,7 +2490,41 @@ export default function App() {
                     key={message.id}
                     className={message.direction === 'outgoing' ? 'message-row outgoing' : 'message-row incoming'}
                   >
-                    <div className="message-bubble">
+                    <div
+                      ref={(node) => {
+                        messageElementRefs.current[message.id] = node;
+                      }}
+                      className={
+                        highlightedMessageId === message.id
+                          ? 'message-bubble highlighted'
+                          : replyingToMessage?.id === message.id
+                            ? 'message-bubble replying'
+                            : 'message-bubble'
+                      }
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => setReplyingToMessage(message)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault();
+                          setReplyingToMessage(message);
+                        }
+                      }}
+                      title="Reply to this message"
+                    >
+                      {message.replyToText ? (
+                        <button
+                          type="button"
+                          className="message-reply"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            jumpToReferencedMessage(message.replyToMessageId, message.replyToText);
+                          }}
+                          title="Go to replied message"
+                        >
+                          ↪ {message.replyToText}
+                        </button>
+                      ) : null}
                       <div>{message.text}</div>
                       {message.timestamp ? <div className="message-time">{formatMessageTimestamp(message.timestamp)}</div> : null}
                     </div>
@@ -2326,6 +2534,14 @@ export default function App() {
             </div>
 
             <div className="chat-compose">
+              {replyingToMessage ? (
+                <div className="chat-replying">
+                  <span>Replying to: {trimReplyPreview(replyingToMessage.text)}</span>
+                  <button type="button" onClick={() => setReplyingToMessage(null)}>
+                    Cancel
+                  </button>
+                </div>
+              ) : null}
               <input
                 value={messageInput}
                 name="chat-message"
