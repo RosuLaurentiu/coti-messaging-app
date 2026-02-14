@@ -371,26 +371,51 @@ body {
   max-width: min(80%, 560px);
   border: 1px solid #243142;
   border-radius: 10px;
-  padding: 10px 12px;
+  padding: 10px 34px 10px 12px;
   font-size: 0.9rem;
   line-height: 1.35;
   background: #111b27;
   min-width: 0;
   overflow-wrap: anywhere;
   word-break: break-word;
+  position: relative;
 }
 
 .message-bubble.replying {
   border-color: #5179ad;
 }
 
-.message-bubble[role='button'] {
+.message-reply-action {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  border: 1px solid #2c3e55;
+  background: #0f1720;
+  color: #9eb0c4;
+  display: grid;
+  place-items: center;
+  font-size: 0.72rem;
+  padding: 0;
   cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease, color 0.15s ease, border-color 0.15s ease;
 }
 
-.message-bubble[role='button']:focus-visible {
-  outline: 1px solid #5179ad;
-  outline-offset: 2px;
+.message-bubble:hover .message-reply-action,
+.message-bubble:focus-within .message-reply-action {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.message-reply-action:hover,
+.message-reply-action:focus-visible {
+  color: #d9e1ea;
+  border-color: #5179ad;
+  outline: none;
 }
 
 .message-reply {
@@ -412,8 +437,24 @@ body {
 }
 
 .message-bubble.highlighted {
-  border-color: #8b5cf6;
-  box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.45);
+  border-color: #a78bfa;
+  box-shadow: 0 0 0 2px rgba(167, 139, 250, 0.55);
+  background: linear-gradient(0deg, rgba(139, 92, 246, 0.18), rgba(139, 92, 246, 0.18)), #111b27;
+  animation: message-highlight-pulse 1.8s ease-out;
+}
+
+.message-row.outgoing .message-bubble.highlighted {
+  background: linear-gradient(0deg, rgba(139, 92, 246, 0.2), rgba(139, 92, 246, 0.2)), #1d2d42;
+  border-color: #bca4ff;
+}
+
+@keyframes message-highlight-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(167, 139, 250, 0.7);
+  }
+  100% {
+    box-shadow: 0 0 0 2px rgba(167, 139, 250, 0.55);
+  }
 }
 
 .message-time {

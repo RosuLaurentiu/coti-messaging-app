@@ -2497,25 +2497,21 @@ export default function App() {
                             ? 'message-bubble replying'
                             : 'message-bubble'
                       }
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => setReplyingToMessage(message)}
-                      onKeyDown={(event) => {
-                        if (event.key === 'Enter' || event.key === ' ') {
-                          event.preventDefault();
-                          setReplyingToMessage(message);
-                        }
-                      }}
-                      title="Reply to this message"
                     >
+                      <button
+                        type="button"
+                        className="message-reply-action"
+                        onClick={() => setReplyingToMessage(message)}
+                        aria-label="Reply to this message"
+                        title="Reply"
+                      >
+                        ↩
+                      </button>
                       {message.replyToText ? (
                         <button
                           type="button"
                           className="message-reply"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            jumpToReferencedMessage(message.replyToMessageId, message.replyToText);
-                          }}
+                          onClick={() => jumpToReferencedMessage(message.replyToMessageId, message.replyToText)}
                           title="Go to replied message"
                         >
                           ↪ {message.replyToText}
