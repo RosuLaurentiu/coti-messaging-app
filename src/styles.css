@@ -16,7 +16,7 @@ body {
 .app-root {
   min-height: 100vh;
   display: grid;
-  grid-template-columns: 320px 1fr;
+  grid-template-columns: 320px 320px 1fr;
 }
 
 .sidebar {
@@ -26,6 +26,15 @@ body {
   flex-direction: column;
   gap: 14px;
   background: #0e141b;
+}
+
+.contacts-sidebar {
+  border-right: 1px solid #1d2631;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  background: #0d131a;
 }
 
 .title {
@@ -83,6 +92,21 @@ body {
 
 .meta-row strong {
   font-weight: 600;
+}
+
+.burner-address-btn {
+  border: none;
+  background: transparent;
+  color: #9eb0c4;
+  padding: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  cursor: pointer;
+}
+
+.burner-address-btn:hover {
+  color: #d9e1ea;
 }
 
 .contact-form {
@@ -349,6 +373,49 @@ body {
 .chat-compose button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(6, 10, 14, 0.72);
+  display: grid;
+  place-items: center;
+  z-index: 50;
+}
+
+.modal-card {
+  width: min(520px, 92vw);
+  border: 1px solid #243142;
+  border-radius: 12px;
+  background: #0f1720;
+  padding: 16px;
+  display: grid;
+  gap: 12px;
+}
+
+.modal-card h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.modal-card input {
+  border: 1px solid #243142;
+  border-radius: 8px;
+  background: #0b141d;
+  color: #d9e1ea;
+  padding: 10px 12px;
+  font-size: 0.9rem;
+}
+
+.modal-card input:focus {
+  outline: 1px solid #3d5a80;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 @media (max-width: 780px) {

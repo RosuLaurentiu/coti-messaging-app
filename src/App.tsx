@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
-import type { BrowserProvider, JsonRpcSigner, OnboardInfo } from '@coti-io/coti-ethers';
+import type { BrowserProvider, JsonRpcSigner, OnboardInfo, Wallet } from '@coti-io/coti-ethers';
 
 declare global {
   interface Window {
@@ -43,7 +43,16 @@ type HistoryEntry = {
 
 const CONTACTS_STORAGE_KEY = 'coti-chat-contacts';
 const ACTIVE_CONTACT_STORAGE_KEY = 'coti-chat-active-contact';
+const BURNER_WALLET_STORAGE_KEY = 'coti-chat-burner-wallet';
 const AUTO_SYNC_INTERVAL_MS = 30000;
+
+type BurnerWalletRecord = {
+  privateKey: string;
+  mnemonic?: string;
+};
+
+type BurnerInitMode = 'generate' | 'import' | 'stored';
+type SignerSource = 'burner' | 'metamask';
 
 const COTI_NETWORK = {
   chainIdHex: '0x282b34',
@@ -67,16 +76,12 @@ const CHAT_CONTRACT_ABI = [
 ] as const;
 
 type CotiEthersModule = typeof import('@coti-io/coti-ethers');
-type WalletConnectProviderModule = typeof import('@walletconnect/ethereum-provider');
 type CotiWsProvider = InstanceType<CotiEthersModule['WebSocketProvider']>;
 type CotiHttpProvider = InstanceType<CotiEthersModule['JsonRpcProvider']>;
 type CotiReadProvider = CotiWsProvider | CotiHttpProvider;
 let cotiEthersModulePromise: Promise<CotiEthersModule> | null = null;
-let walletConnectModulePromise: Promise<WalletConnectProviderModule> | null = null;
 let cotiWsProviderPromise: Promise<CotiWsProvider> | null = null;
 let cotiHttpProviderPromise: Promise<CotiHttpProvider> | null = null;
-
-const WALLETCONNECT_PROJECT_ID = import.meta.env.VITE_WALLETCONNECT_PROJECT_ID as string | undefined;
 
 const loadCotiEthersModule = (): Promise<CotiEthersModule> => {
   if (!cotiEthersModulePromise) {
@@ -84,14 +89,6 @@ const loadCotiEthersModule = (): Promise<CotiEthersModule> => {
   }
 
   return cotiEthersModulePromise;
-};
-
-const loadWalletConnectProviderModule = (): Promise<WalletConnectProviderModule> => {
-  if (!walletConnectModulePromise) {
-    walletConnectModulePromise = import('@walletconnect/ethereum-provider');
-  }
-
-  return walletConnectModulePromise;
 };
 
 const loadCotiWsProvider = async (): Promise<CotiWsProvider> => {
@@ -345,6 +342,35 @@ const loadStoredActiveContact = (): string | null => {
   }
 };
 
+const loadBurnerWalletRecord = (): BurnerWalletRecord | null => {
+  try {
+    const raw = window.localStorage.getItem(BURNER_WALLET_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object') {
+      return null;
+    }
+
+    const parsedRecord = parsed as { privateKey?: unknown; mnemonic?: unknown };
+    const privateKey = typeof parsedRecord.privateKey === 'string' ? parsedRecord.privateKey.trim() : '';
+    if (!/^0x[a-fA-F0-9]{64}$/.test(privateKey)) {
+      return null;
+    }
+
+    const mnemonic = typeof parsedRecord.mnemonic === 'string' ? parsedRecord.mnemonic.trim() : undefined;
+    return { privateKey, mnemonic };
+  } catch {
+    return null;
+  }
+};
+
+const saveBurnerWalletRecord = (record: BurnerWalletRecord): void => {
+  window.localStorage.setItem(BURNER_WALLET_STORAGE_KEY, JSON.stringify(record));
+};
+
 export default function App() {
   const [contacts, setContacts] = useState<Contact[]>(() => loadStoredContacts());
   const [newContact, setNewContact] = useState('');
@@ -355,8 +381,15 @@ export default function App() {
   const [walletAddress, setWalletAddress] = useState<string>('');
   const [chainId, setChainId] = useState<number | null>(null);
   const [status, setStatus] = useState<string>('Disconnected');
-  const [connectionMethod, setConnectionMethod] = useState<'metamask' | 'walletconnect' | null>(null);
-  const [connectingMethod, setConnectingMethod] = useState<'metamask' | 'walletconnect' | null>(null);
+  const [burnerMnemonicBackup, setBurnerMnemonicBackup] = useState('');
+  const [showBurnerMnemonic, setShowBurnerMnemonic] = useState(false);
+  const [burnerImportInput, setBurnerImportInput] = useState('');
+  const [showBurnerImportModal, setShowBurnerImportModal] = useState(false);
+  const [initializingBurner, setInitializingBurner] = useState(false);
+  const [burnerNeedsFunding, setBurnerNeedsFunding] = useState(false);
+  const [activeSignerSource, setActiveSignerSource] = useState<SignerSource>('burner');
+  const [connectionMethod, setConnectionMethod] = useState<'metamask' | null>(null);
+  const [connectingMethod, setConnectingMethod] = useState<'metamask' | null>(null);
   const [onboardStatus, setOnboardStatus] = useState<string>('Not onboarded');
   const [sessionOnboardInfo, setSessionOnboardInfo] = useState<Record<string, OnboardInfo>>({});
   const [messageInput, setMessageInput] = useState('');
@@ -366,6 +399,7 @@ export default function App() {
   const [error, setError] = useState<string>('');
   const [activeProvider, setActiveProvider] = useState<Eip1193Provider | null>(null);
   const activeProviderRef = useRef<Eip1193Provider | null>(null);
+  const burnerWalletRef = useRef<Wallet | null>(null);
   const chatMessagesRef = useRef<HTMLDivElement | null>(null);
   const signerCacheRef = useRef<Record<string, JsonRpcSigner>>({});
   const sendingRef = useRef(false);
@@ -420,6 +454,7 @@ export default function App() {
     () => (walletAddress ? Boolean(sessionOnboardInfo[walletAddress.toLowerCase()]?.aesKey) : false),
     [walletAddress, sessionOnboardInfo]
   );
+  const burnerAddress = burnerWalletRef.current?.address ?? (activeSignerSource === 'burner' ? walletAddress : '');
 
   const setConnectedProvider = (provider: Eip1193Provider | null) => {
     activeProviderRef.current = provider;
@@ -427,15 +462,173 @@ export default function App() {
   };
 
   const getConnectedProvider = (): Eip1193Provider | null => {
-    if (connectionMethod === 'walletconnect') {
-      return activeProviderRef.current ?? activeProvider ?? null;
-    }
-
     if (connectionMethod === 'metamask') {
       return activeProviderRef.current ?? activeProvider ?? window.ethereum ?? null;
     }
 
     return activeProviderRef.current ?? activeProvider ?? null;
+  };
+
+  const createCotiRpcProvider = async () => {
+    const cotiEthers = await loadCotiEthersModule();
+    return new cotiEthers.JsonRpcProvider(COTI_NETWORK.rpcUrl, {
+      name: COTI_NETWORK.chainName,
+      chainId: COTI_NETWORK.chainIdDecimal
+    });
+  };
+
+  const buildBurnerRecord = async (mode: BurnerInitMode, seedOrPrivateKey?: string): Promise<BurnerWalletRecord> => {
+    const normalizedSeed = seedOrPrivateKey?.trim() ?? '';
+    const cotiEthers = await loadCotiEthersModule();
+
+    if (mode === 'import') {
+      if (normalizedSeed.length === 0) {
+        throw new Error('Enter a mnemonic phrase or private key.');
+      }
+
+      if (/^0x[a-fA-F0-9]{64}$/.test(normalizedSeed)) {
+        return { privateKey: normalizedSeed };
+      }
+
+      const importedWallet = cotiEthers.Wallet.fromPhrase(normalizedSeed);
+      return {
+        privateKey: importedWallet.privateKey,
+        mnemonic: normalizedSeed
+      };
+    }
+
+    if (mode === 'stored') {
+      const cached = loadBurnerWalletRecord();
+      if (!cached) {
+        throw new Error('No saved burner wallet found. Generate or import one first.');
+      }
+      return cached;
+    }
+
+    const createdWallet = cotiEthers.Wallet.createRandom();
+    return {
+      privateKey: createdWallet.privateKey,
+      mnemonic: createdWallet.mnemonic?.phrase
+    };
+  };
+
+  const initializeBurnerWallet = async (mode: BurnerInitMode, seedOrPrivateKey?: string): Promise<boolean> => {
+    setError('');
+    setInitializingBurner(true);
+    setBurnerNeedsFunding(false);
+
+    try {
+      const burnerRecord = await buildBurnerRecord(mode, seedOrPrivateKey);
+      saveBurnerWalletRecord(burnerRecord);
+
+      const cotiEthers = await loadCotiEthersModule();
+      const rpcProvider = await createCotiRpcProvider();
+      const burnerWallet = new cotiEthers.Wallet(burnerRecord.privateKey, rpcProvider);
+
+      burnerWalletRef.current = burnerWallet;
+      setWalletAddress(burnerWallet.address);
+      setChainId(COTI_NETWORK.chainIdDecimal);
+      setStatus('Connecting burner wallet...');
+
+      if (burnerRecord.mnemonic) {
+        setBurnerMnemonicBackup(burnerRecord.mnemonic);
+        setShowBurnerMnemonic(mode === 'generate');
+      } else {
+        setBurnerMnemonicBackup('');
+        setShowBurnerMnemonic(false);
+      }
+
+      const cacheKey = burnerWallet.address.toLowerCase();
+      const cachedOnboardInfo = sessionOnboardInfo[cacheKey];
+      if (cachedOnboardInfo) {
+        burnerWallet.setUserOnboardInfo(cachedOnboardInfo);
+      }
+
+      setOnboardStatus('Onboarding...');
+      await burnerWallet.generateOrRecoverAes();
+      const onboardInfo = burnerWallet.getUserOnboardInfo();
+
+      if (!onboardInfo?.aesKey) {
+        throw new Error('AES key unavailable for burner wallet.');
+      }
+
+      setSessionOnboardInfo((previous) => ({
+        ...previous,
+        [cacheKey]: mergeOnboardInfo(previous[cacheKey], onboardInfo)
+      }));
+      setOnboardStatus('AES key ready');
+      setStatus('Connected (Burner)');
+      setActiveSignerSource('burner');
+      setConnectionMethod(null);
+      setConnectedProvider(null);
+      setBurnerImportInput('');
+      await syncConversationHistoryRef.current();
+      return true;
+    } catch (burnerError) {
+      const message = burnerError instanceof Error ? burnerError.message : 'Failed to initialize burner wallet.';
+      if (message.includes('Account balance is 0 so user cannot be onboarded')) {
+        setBurnerNeedsFunding(true);
+        setStatus('Burner needs funding');
+      } else {
+        setStatus('Disconnected');
+      }
+      setError(message);
+      setOnboardStatus('Not onboarded');
+      return false;
+    } finally {
+      setInitializingBurner(false);
+    }
+  };
+
+  const importBurnerWallet = async () => {
+    const imported = await initializeBurnerWallet('import', burnerImportInput);
+    if (imported) {
+      setShowBurnerImportModal(false);
+    }
+  };
+
+  const topUpBurnerWithMetaMask = async () => {
+    setError('');
+
+    const burnerAddress = burnerWalletRef.current?.address ?? (activeSignerSource === 'burner' ? walletAddress : '');
+
+    if (!burnerAddress || !isWalletAddress(burnerAddress)) {
+      setError('Initialize burner wallet first.');
+      return;
+    }
+
+    const provider = window.ethereum;
+    if (!provider) {
+      setError('MetaMask not detected. Please install MetaMask to top up burner wallet.');
+      return;
+    }
+
+    try {
+      setStatus('Top up in progress...');
+      await provider.request({ method: 'eth_requestAccounts' });
+      await ensureCotiNetwork(provider);
+
+      const browserProvider = await createCotiBrowserProvider(provider);
+      const funderSigner = await browserProvider.getSigner();
+      const cotiEthers = await loadCotiEthersModule();
+      const readProvider = await loadCotiReadProvider(true);
+      const readContract = new cotiEthers.Contract(CHAT_CONTRACT_ADDRESS, CHAT_CONTRACT_ABI, readProvider);
+      const requiredFee = (await readContract.feeAmount()) as bigint;
+      const minimumTopUp = 1_000_000_000_000_000n;
+      const topUpAmount = requiredFee > 0n ? requiredFee * 20n : minimumTopUp;
+
+      const tx = await funderSigner.sendTransaction({
+        to: burnerAddress,
+        value: topUpAmount
+      });
+      await tx.wait();
+
+      await initializeBurnerWallet('stored');
+    } catch (fundError) {
+      const message = fundError instanceof Error ? fundError.message : 'Failed to top up burner wallet.';
+      setError(message);
+      setStatus('Burner needs funding');
+    }
   };
 
   const scrollChatToBottom = () => {
@@ -637,6 +830,7 @@ export default function App() {
 
       setConnectedProvider(provider);
       setConnectionMethod('metamask');
+      setActiveSignerSource('metamask');
       setWalletAddress(selected);
 
       await onboardAddressAes(selected, provider);
@@ -654,67 +848,11 @@ export default function App() {
     }
   };
 
-  const connectWalletConnect = async () => {
-    setError('');
-    setConnectingMethod('walletconnect');
-
-    if (!WALLETCONNECT_PROJECT_ID) {
-      setError('Missing VITE_WALLETCONNECT_PROJECT_ID in .env.');
-      setConnectingMethod(null);
-      return;
-    }
-
-    let walletConnectProvider: Eip1193Provider | null = null;
-
-    try {
-      setStatus('Connecting WalletConnect...');
-      const walletConnectModule = await loadWalletConnectProviderModule();
-      const wcProvider = await walletConnectModule.EthereumProvider.init({
-        projectId: WALLETCONNECT_PROJECT_ID,
-        chains: [COTI_NETWORK.chainIdDecimal],
-        optionalChains: [COTI_NETWORK.chainIdDecimal],
-        showQrModal: true,
-        rpcMap: {
-          [COTI_NETWORK.chainIdDecimal]: COTI_NETWORK.rpcUrl
-        }
-      });
-
-      walletConnectProvider = wcProvider as unknown as Eip1193Provider;
-      await walletConnectProvider.connect?.();
-      const accounts = (await walletConnectProvider.request({ method: 'eth_accounts' })) as string[];
-      const selected = accounts[0] ?? '';
-
-      if (!selected) {
-        throw new Error('No wallet account selected via WalletConnect.');
-      }
-
-      setConnectedProvider(walletConnectProvider);
-      setConnectionMethod('walletconnect');
-      setWalletAddress(selected);
-
-      await onboardAddressAes(selected, walletConnectProvider);
-      const currentChain = (await walletConnectProvider.request({ method: 'eth_chainId' })) as string | number;
-      setChainId(normalizeChainId(currentChain));
-      setStatus('Connected (WalletConnect)');
-      await syncConversationHistory();
-    } catch (connectionError) {
-      try {
-        await walletConnectProvider?.disconnect?.();
-      } catch {
-      }
-      const message = connectionError instanceof Error ? connectionError.message : 'Failed to connect WalletConnect.';
-      setError(message);
-      setStatus('Disconnected');
-      setOnboardStatus('Not onboarded');
-      setConnectedProvider(null);
-      setConnectionMethod(null);
-    } finally {
-      setConnectingMethod(null);
-    }
-  };
-
   const disconnectWallet = async () => {
     setError('');
+
+    burnerWalletRef.current = null;
+    setBurnerNeedsFunding(false);
 
     const provider = getConnectedProvider();
 
@@ -728,16 +866,10 @@ export default function App() {
     } catch {
     }
 
-    try {
-      if (connectionMethod === 'walletconnect') {
-        await provider?.disconnect?.();
-      }
-    } catch {
-    }
-
     setWalletAddress('');
     setChainId(null);
     setStatus('Disconnected');
+    setActiveSignerSource('burner');
     setConnectionMethod(null);
     setOnboardStatus('Not onboarded');
     setSessionOnboardInfo({});
@@ -746,26 +878,56 @@ export default function App() {
   };
 
   const getMemoSigner = async () => {
-    const provider = getConnectedProvider();
-    if (!provider) {
-      throw new Error('Wallet provider not detected. Connect with MetaMask or WalletConnect.');
+    if (activeSignerSource === 'metamask') {
+      const provider = getConnectedProvider();
+      if (!provider) {
+        throw new Error('Wallet provider not detected. Connect without burner first.');
+      }
+
+      if (!walletAddress) {
+        throw new Error('Connect your wallet first.');
+      }
+
+      if (chainId !== COTI_NETWORK.chainIdDecimal) {
+        throw new Error('Switch to COTI network first.');
+      }
+
+      const cacheKey = walletAddress.toLowerCase();
+      let signer = signerCacheRef.current[cacheKey];
+      if (!signer) {
+        const browserProvider = await createCotiBrowserProvider(provider);
+        signer = await browserProvider.getSigner(walletAddress, sessionOnboardInfo[cacheKey]);
+        signerCacheRef.current[cacheKey] = signer;
+      }
+
+      let onboardInfo = signer.getUserOnboardInfo();
+      if (!onboardInfo?.aesKey) {
+        await signer.generateOrRecoverAes();
+        onboardInfo = signer.getUserOnboardInfo();
+      }
+
+      if (!onboardInfo?.aesKey) {
+        throw new Error('AES key unavailable in this session. Please sign to enable encryption.');
+      }
+
+      setSessionOnboardInfo((previous) => ({
+        ...previous,
+        [cacheKey]: mergeOnboardInfo(previous[cacheKey], onboardInfo)
+      }));
+
+      setOnboardStatus('AES key ready');
+      return { signer, cacheKey };
     }
 
-    if (!walletAddress) {
-      throw new Error('Connect your wallet first.');
-    }
-
-    if (chainId !== COTI_NETWORK.chainIdDecimal) {
-      throw new Error('Switch to COTI network first.');
-    }
-
-    const cacheKey = walletAddress.toLowerCase();
-
-    let signer = signerCacheRef.current[cacheKey];
+    const signer = burnerWalletRef.current;
     if (!signer) {
-      const browserProvider = await createCotiBrowserProvider(provider);
-      signer = await browserProvider.getSigner(walletAddress, sessionOnboardInfo[cacheKey]);
-      signerCacheRef.current[cacheKey] = signer;
+      throw new Error('Burner wallet not initialized.');
+    }
+
+    const cacheKey = signer.address.toLowerCase();
+    const cachedOnboardInfo = sessionOnboardInfo[cacheKey];
+    if (cachedOnboardInfo) {
+      signer.setUserOnboardInfo(cachedOnboardInfo);
     }
 
     let onboardInfo = signer.getUserOnboardInfo();
@@ -1211,33 +1373,69 @@ export default function App() {
       <aside className="sidebar">
         <h1 className="title">COTI Chat</h1>
 
+        <button className="connect-btn" onClick={() => initializeBurnerWallet('generate')} type="button" disabled={initializingBurner}>
+          {initializingBurner ? 'Initializing Burner...' : 'Generate Burner Wallet'}
+        </button>
+
+        <button className="connect-btn" onClick={() => initializeBurnerWallet('stored')} type="button" disabled={initializingBurner}>
+          Connect Burner Wallet
+        </button>
+
+        <button className="connect-btn" onClick={() => setShowBurnerImportModal(true)} type="button" disabled={initializingBurner}>
+          Import Burner Wallet
+        </button>
+
+        <button className="connect-btn" onClick={topUpBurnerWithMetaMask} type="button" disabled={initializingBurner || !burnerAddress}>
+          Top Up Burner (MetaMask)
+        </button>
+
+        <div className="wallet-meta">
+          <div className="meta-row">
+            <span>Burner wallet</span>
+            {burnerAddress ? (
+              <button
+                type="button"
+                className="burner-address-btn"
+                onClick={() => copyAddressToClipboard(burnerAddress)}
+                title={burnerAddress}
+              >
+                {shortenAddress(burnerAddress)}
+              </button>
+            ) : (
+              <strong>—</strong>
+            )}
+          </div>
+        </div>
+
+        {burnerNeedsFunding ? <p className="error">Burner needs funding before onboarding.</p> : null}
+        {burnerMnemonicBackup ? (
+          <div className="wallet-meta">
+            <div className="meta-row">
+              <span>Burner backup</span>
+              <button
+                type="button"
+                className="burner-address-btn"
+                onClick={() => setShowBurnerMnemonic((previous) => !previous)}
+              >
+                {showBurnerMnemonic ? 'Hide phrase' : 'Show phrase'}
+              </button>
+            </div>
+            {showBurnerMnemonic ? <p>{burnerMnemonicBackup}</p> : null}
+          </div>
+        ) : null}
+
         <button
           className="connect-btn"
           onClick={connectAndOnboard}
           type="button"
-          disabled={connectingMethod !== null || (isConnected && connectionMethod === 'walletconnect')}
+          disabled={connectingMethod !== null}
         >
           {connectingMethod === 'metamask'
             ? 'Connecting MetaMask...'
             : !isConnected || connectionMethod !== 'metamask'
-            ? 'Connect MetaMask + Sign AES'
+            ? 'Connect without burner'
             : onboardStatus === 'AES key ready'
               ? 'MetaMask + AES Ready'
-              : 'Sign AES Key'}
-        </button>
-
-        <button
-          className="connect-btn"
-          onClick={connectWalletConnect}
-          type="button"
-          disabled={connectingMethod !== null || (isConnected && connectionMethod === 'metamask')}
-        >
-          {connectingMethod === 'walletconnect'
-            ? 'Connecting WalletConnect...'
-            : !isConnected || connectionMethod !== 'walletconnect'
-            ? 'Connect WalletConnect + Sign AES'
-            : onboardStatus === 'AES key ready'
-              ? 'WalletConnect + AES Ready'
               : 'Sign AES Key'}
         </button>
 
@@ -1263,6 +1461,11 @@ export default function App() {
             <strong>{onboardStatus}</strong>
           </div>
         </div>
+
+      </aside>
+
+      <aside className="contacts-sidebar">
+        <h2 className="title">Contacts</h2>
 
         <form className="contact-form" onSubmit={handleAddContact}>
           <input
@@ -1411,6 +1614,40 @@ export default function App() {
           <div className="chat-placeholder">Select a contact to start messaging.</div>
         )}
       </main>
+
+      {showBurnerImportModal ? (
+        <div
+          className="modal-backdrop"
+          onClick={() => {
+            if (!initializingBurner) {
+              setShowBurnerImportModal(false);
+            }
+          }}
+        >
+          <div className="modal-card" onClick={(event) => event.stopPropagation()}>
+            <h3>Import Burner Wallet</h3>
+            <input
+              value={burnerImportInput}
+              onChange={(event) => setBurnerImportInput(event.target.value)}
+              placeholder="Mnemonic phrase or 0x private key"
+              aria-label="Import burner wallet"
+            />
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="connect-btn"
+                onClick={() => setShowBurnerImportModal(false)}
+                disabled={initializingBurner}
+              >
+                Cancel
+              </button>
+              <button type="button" className="connect-btn" onClick={importBurnerWallet} disabled={initializingBurner}>
+                {initializingBurner ? 'Importing...' : 'Import'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
