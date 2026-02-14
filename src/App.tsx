@@ -226,13 +226,19 @@ const formatMessageTimestamp = (timestamp?: number): string => {
   });
 };
 
-const calculateTopUpAmount = (requiredFee: bigint): bigint => (requiredFee > 0n ? requiredFee * 20n : MIN_BURNER_TOP_UP_WEI);
+const calculateTopUpAmount = (requiredFee: bigint, multiplier: number): bigint => {
+  const safeMultiplier = Math.max(1, Math.floor(multiplier));
+  return requiredFee > 0n ? requiredFee * BigInt(safeMultiplier) : MIN_BURNER_TOP_UP_WEI * BigInt(safeMultiplier);
+};
 
 const formatCotiAmount = (weiAmount: bigint): string => {
   const whole = weiAmount / COTI_WEI;
   const fraction = (weiAmount % COTI_WEI).toString().padStart(18, '0').slice(0, 6).replace(/0+$/, '');
   return fraction ? `${whole.toString()}.${fraction}` : whole.toString();
 };
+
+const hasInsufficientFundsError = (message: string): boolean =>
+  /insufficient funds|exceeds balance|not enough funds|account balance is 0/i.test(message);
 
 const toBigIntArray = (value: unknown): bigint[] => {
   const parseSingle = (item: unknown): bigint[] => {
@@ -535,6 +541,7 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const [syncingHistory, setSyncingHistory] = useState(false);
   const [topUpAmountWei, setTopUpAmountWei] = useState<bigint | null>(null);
+  const [topUpMultiplier, setTopUpMultiplier] = useState(20);
   const [loadingTopUpQuote, setLoadingTopUpQuote] = useState(false);
   const [error, setError] = useState<string>('');
   const [activeProvider, setActiveProvider] = useState<Eip1193Provider | null>(null);
@@ -756,7 +763,7 @@ export default function App() {
         const readProvider = await loadCotiReadProvider(true);
         const readContract = new cotiEthers.Contract(CHAT_CONTRACT_ADDRESS, CHAT_CONTRACT_ABI, readProvider);
         const requiredFee = (await readContract.feeAmount()) as bigint;
-        topUpAmount = calculateTopUpAmount(requiredFee);
+        topUpAmount = calculateTopUpAmount(requiredFee, topUpMultiplier);
       }
 
       const tx = await funderSigner.sendTransaction({
@@ -1398,6 +1405,15 @@ export default function App() {
     } catch (sendError) {
       const message = sendError instanceof Error ? sendError.message : 'Failed to send message.';
       setError(message);
+
+      if (activeSignerSource === 'burner' && hasInsufficientFundsError(message)) {
+        const shouldTopUp = window.confirm(
+          'Burner wallet has insufficient funds. Do you want to top up now with MetaMask?'
+        );
+        if (shouldTopUp) {
+          await topUpBurnerWithMetaMask();
+        }
+      }
     } finally {
       sendingRef.current = false;
       setSending(false);
@@ -1516,7 +1532,7 @@ export default function App() {
         const readContract = new cotiEthers.Contract(CHAT_CONTRACT_ADDRESS, CHAT_CONTRACT_ABI, readProvider);
         const requiredFee = (await readContract.feeAmount()) as bigint;
         if (!cancelled) {
-          setTopUpAmountWei(calculateTopUpAmount(requiredFee));
+          setTopUpAmountWei(calculateTopUpAmount(requiredFee, topUpMultiplier));
         }
       } catch {
         if (!cancelled) {
@@ -1534,7 +1550,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [burnerAddress]);
+  }, [burnerAddress, topUpMultiplier]);
 
   useEffect(() => {
     if (!walletAddress || chainId !== COTI_NETWORK.chainIdDecimal) {
@@ -1659,7 +1675,22 @@ export default function App() {
         <button className="connect-btn" onClick={topUpBurnerWithMetaMask} type="button" disabled={initializingBurner || !burnerAddress}>
           Top Up Burner (MetaMask)
         </button>
-        <div className="wallet-meta">
+        <div className="wallet-meta topup-meta">
+          <div className="meta-row">
+            <span>Top up scale</span>
+            <strong>x{topUpMultiplier}</strong>
+          </div>
+          <input
+            className="topup-slider"
+            type="range"
+            min={1}
+            max={100}
+            step={1}
+            value={topUpMultiplier}
+            onChange={(event) => setTopUpMultiplier(Number(event.target.value))}
+            aria-label="Top up multiplier"
+          />
+          <p>Approx messages per top up: {topUpMultiplier}</p>
           <div className="meta-row">
             <span>Top up amount</span>
             <strong>

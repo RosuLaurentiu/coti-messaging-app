@@ -96,6 +96,29 @@ body {
   outline: 1px solid #3d5a80;
 }
 
+.topup-meta {
+  gap: 10px;
+}
+
+.topup-meta p {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #9eb0c4;
+}
+
+.wallet-meta input.topup-slider {
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  accent-color: #8b5cf6;
+}
+
+.wallet-meta input.topup-slider:focus {
+  outline: none;
+}
+
 .meta-row {
   display: flex;
   justify-content: space-between;
