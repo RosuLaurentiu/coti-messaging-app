@@ -343,6 +343,7 @@ body {
 .chat-messages {
   padding: 14px;
   overflow-y: auto;
+  overflow-x: hidden;
   display: grid;
   gap: 10px;
   align-content: start;
@@ -374,6 +375,9 @@ body {
   font-size: 0.9rem;
   line-height: 1.35;
   background: #111b27;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .message-bubble.replying {
