@@ -541,8 +541,11 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const [syncingHistory, setSyncingHistory] = useState(false);
   const [topUpAmountWei, setTopUpAmountWei] = useState<bigint | null>(null);
+  const [requiredFeeWei, setRequiredFeeWei] = useState<bigint | null>(null);
+  const [burnerBalanceWei, setBurnerBalanceWei] = useState<bigint | null>(null);
   const [topUpMultiplier, setTopUpMultiplier] = useState(20);
   const [loadingTopUpQuote, setLoadingTopUpQuote] = useState(false);
+  const [topUpMetricsNonce, setTopUpMetricsNonce] = useState(0);
   const [error, setError] = useState<string>('');
   const [activeProvider, setActiveProvider] = useState<Eip1193Provider | null>(null);
   const activeProviderRef = useRef<Eip1193Provider | null>(null);
@@ -602,6 +605,13 @@ export default function App() {
     [walletAddress, sessionOnboardInfo]
   );
   const burnerAddress = burnerWalletRef.current?.address ?? (activeSignerSource === 'burner' ? walletAddress : '');
+  const estimatedMessagesLeft = useMemo(() => {
+    if (requiredFeeWei === null || burnerBalanceWei === null || requiredFeeWei <= 0n) {
+      return null;
+    }
+
+    return burnerBalanceWei / requiredFeeWei;
+  }, [requiredFeeWei, burnerBalanceWei]);
 
   const setConnectedProvider = (provider: Eip1193Provider | null) => {
     activeProviderRef.current = provider;
@@ -766,11 +776,18 @@ export default function App() {
         topUpAmount = calculateTopUpAmount(requiredFee, topUpMultiplier);
       }
 
+      if (topUpAmount === null) {
+        throw new Error('Unable to calculate top-up amount.');
+      }
+
       const tx = await funderSigner.sendTransaction({
         to: burnerAddress,
         value: topUpAmount
       });
       await tx.wait();
+
+      setBurnerBalanceWei((previous) => (previous !== null ? previous + topUpAmount : previous));
+      setTopUpMetricsNonce((previous) => previous + 1);
 
       await initializeBurnerWallet('stored');
     } catch (fundError) {
@@ -1402,6 +1419,9 @@ export default function App() {
 
       setMessageInput('');
       await syncConversationHistory();
+      if (activeSignerSource === 'burner') {
+        setTopUpMetricsNonce((previous) => previous + 1);
+      }
     } catch (sendError) {
       const message = sendError instanceof Error ? sendError.message : 'Failed to send message.';
       setError(message);
@@ -1520,6 +1540,8 @@ export default function App() {
 
     if (!burnerAddress || !isWalletAddress(burnerAddress)) {
       setTopUpAmountWei(null);
+      setRequiredFeeWei(null);
+      setBurnerBalanceWei(null);
       setLoadingTopUpQuote(false);
       return;
     }
@@ -1530,13 +1552,20 @@ export default function App() {
         const cotiEthers = await loadCotiEthersModule();
         const readProvider = await loadCotiReadProvider(true);
         const readContract = new cotiEthers.Contract(CHAT_CONTRACT_ADDRESS, CHAT_CONTRACT_ABI, readProvider);
-        const requiredFee = (await readContract.feeAmount()) as bigint;
+        const [requiredFee, burnerBalance] = (await Promise.all([
+          readContract.feeAmount(),
+          readProvider.getBalance(burnerAddress)
+        ])) as [bigint, bigint];
         if (!cancelled) {
+          setRequiredFeeWei(requiredFee);
+          setBurnerBalanceWei(burnerBalance);
           setTopUpAmountWei(calculateTopUpAmount(requiredFee, topUpMultiplier));
         }
       } catch {
         if (!cancelled) {
           setTopUpAmountWei(null);
+          setRequiredFeeWei(null);
+          setBurnerBalanceWei(null);
         }
       } finally {
         if (!cancelled) {
@@ -1550,7 +1579,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [burnerAddress, topUpMultiplier]);
+  }, [burnerAddress, topUpMultiplier, topUpMetricsNonce]);
 
   useEffect(() => {
     if (!walletAddress || chainId !== COTI_NETWORK.chainIdDecimal) {
@@ -1691,6 +1720,26 @@ export default function App() {
             aria-label="Top up multiplier"
           />
           <p>Approx messages per top up: {topUpMultiplier}</p>
+          <div className="meta-row">
+            <span>Wallet balance</span>
+            <strong>
+              {loadingTopUpQuote
+                ? 'Calculating...'
+                : burnerBalanceWei !== null
+                  ? `${formatCotiAmount(burnerBalanceWei)} COTI`
+                  : '—'}
+            </strong>
+          </div>
+          <div className="meta-row">
+            <span>Messages left</span>
+            <strong>
+              {loadingTopUpQuote
+                ? 'Calculating...'
+                : estimatedMessagesLeft !== null
+                  ? estimatedMessagesLeft.toString()
+                  : '—'}
+            </strong>
+          </div>
           <div className="meta-row">
             <span>Top up amount</span>
             <strong>
