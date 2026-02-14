@@ -44,6 +44,10 @@ type HistoryEntry = {
 const CONTACTS_STORAGE_KEY = 'coti-chat-contacts';
 const ACTIVE_CONTACT_STORAGE_KEY = 'coti-chat-active-contact';
 const BURNER_WALLET_STORAGE_KEY = 'coti-chat-burner-wallet';
+const BURNER_WALLET_STORAGE_VERSION = 2;
+const BURNER_PIN_MIN_LENGTH = 5;
+const LEGACY_BURNER_PIN_MIN_LENGTH = 4;
+const BURNER_PIN_PBKDF2_ITERATIONS = 250000;
 const PROFILE_STORAGE_KEY = 'coti-chat-profile';
 const PROFILE_SHARED_STORAGE_KEY = 'coti-chat-profile-shared';
 const AUTO_SYNC_INTERVAL_MS = 30000;
@@ -58,12 +62,31 @@ type BurnerWalletRecord = {
   mnemonic?: string;
 };
 
+type EncryptedBurnerWalletRecord = {
+  version: number;
+  salt: string;
+  iv: string;
+  ciphertext: string;
+  iterations: number;
+};
+
+type BurnerWalletStorageState =
+  | { kind: 'none' }
+  | { kind: 'legacy'; record: BurnerWalletRecord }
+  | { kind: 'encrypted'; record: EncryptedBurnerWalletRecord };
+
 type UserProfile = {
   nickname: string;
 };
 
 type BurnerInitMode = 'generate' | 'import' | 'stored';
 type SignerSource = 'burner' | 'metamask';
+type BurnerPinMode = 'set' | 'unlock';
+
+type PendingBurnerInit = {
+  mode: BurnerInitMode;
+  seedOrPrivateKey?: string;
+};
 
 const COTI_NETWORK = {
   chainIdHex: '0x282b34',
@@ -372,33 +395,160 @@ const loadStoredActiveContact = (): string | null => {
   }
 };
 
-const loadBurnerWalletRecord = (): BurnerWalletRecord | null => {
+const bytesToBase64 = (value: Uint8Array): string => {
+  let binary = '';
+  for (let index = 0; index < value.length; index += 1) {
+    binary += String.fromCharCode(value[index]);
+  }
+  return btoa(binary);
+};
+
+const base64ToBytes = (value: string): Uint8Array => {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+};
+
+const toArrayBuffer = (value: Uint8Array): ArrayBuffer =>
+  value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength) as ArrayBuffer;
+
+const parseBurnerWalletStorageState = (): BurnerWalletStorageState => {
   try {
     const raw = window.localStorage.getItem(BURNER_WALLET_STORAGE_KEY);
     if (!raw) {
-      return null;
+      return { kind: 'none' };
     }
 
     const parsed = JSON.parse(raw) as unknown;
     if (!parsed || typeof parsed !== 'object') {
-      return null;
+      return { kind: 'none' };
     }
 
-    const parsedRecord = parsed as { privateKey?: unknown; mnemonic?: unknown };
-    const privateKey = typeof parsedRecord.privateKey === 'string' ? parsedRecord.privateKey.trim() : '';
+    const encryptedCandidate = parsed as {
+      version?: unknown;
+      salt?: unknown;
+      iv?: unknown;
+      ciphertext?: unknown;
+      iterations?: unknown;
+    };
+
+    if (
+      encryptedCandidate.version === BURNER_WALLET_STORAGE_VERSION &&
+      typeof encryptedCandidate.salt === 'string' &&
+      typeof encryptedCandidate.iv === 'string' &&
+      typeof encryptedCandidate.ciphertext === 'string' &&
+      typeof encryptedCandidate.iterations === 'number'
+    ) {
+      return {
+        kind: 'encrypted',
+        record: {
+          version: encryptedCandidate.version,
+          salt: encryptedCandidate.salt,
+          iv: encryptedCandidate.iv,
+          ciphertext: encryptedCandidate.ciphertext,
+          iterations: encryptedCandidate.iterations
+        }
+      };
+    }
+
+    const legacyCandidate = parsed as { privateKey?: unknown; mnemonic?: unknown };
+    const privateKey = typeof legacyCandidate.privateKey === 'string' ? legacyCandidate.privateKey.trim() : '';
     if (!/^0x[a-fA-F0-9]{64}$/.test(privateKey)) {
-      return null;
+      return { kind: 'none' };
     }
 
-    const mnemonic = typeof parsedRecord.mnemonic === 'string' ? parsedRecord.mnemonic.trim() : undefined;
-    return { privateKey, mnemonic };
+    const mnemonic = typeof legacyCandidate.mnemonic === 'string' ? legacyCandidate.mnemonic.trim() : undefined;
+    return {
+      kind: 'legacy',
+      record: { privateKey, mnemonic }
+    };
   } catch {
-    return null;
+    return { kind: 'none' };
   }
 };
 
-const saveBurnerWalletRecord = (record: BurnerWalletRecord): void => {
-  window.localStorage.setItem(BURNER_WALLET_STORAGE_KEY, JSON.stringify(record));
+const deriveBurnerPinKey = async (
+  pin: string,
+  salt: Uint8Array,
+  iterations: number,
+  usages: KeyUsage[]
+): Promise<CryptoKey> => {
+  const pinMaterial = await window.crypto.subtle.importKey('raw', new TextEncoder().encode(pin), 'PBKDF2', false, [
+    'deriveKey'
+  ]);
+
+  return window.crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: toArrayBuffer(salt),
+      iterations,
+      hash: 'SHA-256'
+    },
+    pinMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    usages
+  );
+};
+
+const encryptBurnerWalletRecord = async (record: BurnerWalletRecord, pin: string): Promise<EncryptedBurnerWalletRecord> => {
+  const salt = window.crypto.getRandomValues(new Uint8Array(16));
+  const iv = window.crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveBurnerPinKey(pin, salt, BURNER_PIN_PBKDF2_ITERATIONS, ['encrypt']);
+
+  const payload = JSON.stringify(record);
+  const encrypted = await window.crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: toArrayBuffer(iv) },
+    key,
+    new TextEncoder().encode(payload)
+  );
+
+  return {
+    version: BURNER_WALLET_STORAGE_VERSION,
+    salt: bytesToBase64(salt),
+    iv: bytesToBase64(iv),
+    ciphertext: bytesToBase64(new Uint8Array(encrypted)),
+    iterations: BURNER_PIN_PBKDF2_ITERATIONS
+  };
+};
+
+const decryptBurnerWalletRecord = async (
+  encryptedRecord: EncryptedBurnerWalletRecord,
+  pin: string
+): Promise<BurnerWalletRecord> => {
+  const salt = base64ToBytes(encryptedRecord.salt);
+  const iv = base64ToBytes(encryptedRecord.iv);
+  const ciphertext = base64ToBytes(encryptedRecord.ciphertext);
+  const key = await deriveBurnerPinKey(pin, salt, encryptedRecord.iterations, ['decrypt']);
+
+  const decrypted = await window.crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: toArrayBuffer(iv) },
+    key,
+    toArrayBuffer(ciphertext)
+  );
+  const rawPayload = new TextDecoder().decode(decrypted);
+  const parsed = JSON.parse(rawPayload) as unknown;
+
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('Invalid burner wallet payload.');
+  }
+
+  const parsedRecord = parsed as { privateKey?: unknown; mnemonic?: unknown };
+  const privateKey = typeof parsedRecord.privateKey === 'string' ? parsedRecord.privateKey.trim() : '';
+  if (!/^0x[a-fA-F0-9]{64}$/.test(privateKey)) {
+    throw new Error('Invalid burner wallet private key format.');
+  }
+
+  const mnemonic = typeof parsedRecord.mnemonic === 'string' ? parsedRecord.mnemonic.trim() : undefined;
+  return { privateKey, mnemonic };
+};
+
+const saveEncryptedBurnerWalletRecord = async (record: BurnerWalletRecord, pin: string): Promise<void> => {
+  const encrypted = await encryptBurnerWalletRecord(record, pin);
+  window.localStorage.setItem(BURNER_WALLET_STORAGE_KEY, JSON.stringify(encrypted));
 };
 
 const loadStoredProfile = (walletAddress?: string | null): UserProfile => {
@@ -527,6 +677,11 @@ export default function App() {
   const [showBurnerMnemonic, setShowBurnerMnemonic] = useState(false);
   const [burnerImportInput, setBurnerImportInput] = useState('');
   const [showBurnerImportModal, setShowBurnerImportModal] = useState(false);
+  const [showBurnerPinModal, setShowBurnerPinModal] = useState(false);
+  const [burnerPinMode, setBurnerPinMode] = useState<BurnerPinMode>('unlock');
+  const [burnerPinInput, setBurnerPinInput] = useState('');
+  const [burnerPinConfirmInput, setBurnerPinConfirmInput] = useState('');
+  const [pendingBurnerInit, setPendingBurnerInit] = useState<PendingBurnerInit | null>(null);
   const [initializingBurner, setInitializingBurner] = useState(false);
   const [burnerNeedsFunding, setBurnerNeedsFunding] = useState(false);
   const [myNickname, setMyNickname] = useState('');
@@ -550,6 +705,8 @@ export default function App() {
   const [activeProvider, setActiveProvider] = useState<Eip1193Provider | null>(null);
   const activeProviderRef = useRef<Eip1193Provider | null>(null);
   const burnerWalletRef = useRef<Wallet | null>(null);
+  const burnerRecordRef = useRef<BurnerWalletRecord | null>(null);
+  const burnerPinRef = useRef<string>('');
   const chatMessagesRef = useRef<HTMLDivElement | null>(null);
   const signerCacheRef = useRef<Record<string, JsonRpcSigner>>({});
   const sendingRef = useRef(false);
@@ -634,7 +791,11 @@ export default function App() {
     });
   };
 
-  const buildBurnerRecord = async (mode: BurnerInitMode, seedOrPrivateKey?: string): Promise<BurnerWalletRecord> => {
+  const buildBurnerRecord = async (
+    mode: BurnerInitMode,
+    seedOrPrivateKey?: string,
+    pin?: string
+  ): Promise<BurnerWalletRecord> => {
     const normalizedSeed = seedOrPrivateKey?.trim() ?? '';
     const cotiEthers = await loadCotiEthersModule();
 
@@ -655,11 +816,24 @@ export default function App() {
     }
 
     if (mode === 'stored') {
-      const cached = loadBurnerWalletRecord();
-      if (!cached) {
+      const storageState = parseBurnerWalletStorageState();
+      if (storageState.kind === 'none') {
         throw new Error('No saved burner wallet found. Generate or import one first.');
       }
-      return cached;
+
+      if (storageState.kind === 'legacy') {
+        return storageState.record;
+      }
+
+      if (!pin) {
+        throw new Error('Enter PIN to unlock burner wallet.');
+      }
+
+      try {
+        return await decryptBurnerWalletRecord(storageState.record, pin);
+      } catch {
+        throw new Error('Invalid PIN or corrupted burner wallet data.');
+      }
     }
 
     const createdWallet = cotiEthers.Wallet.createRandom();
@@ -669,20 +843,39 @@ export default function App() {
     };
   };
 
-  const initializeBurnerWallet = async (mode: BurnerInitMode, seedOrPrivateKey?: string): Promise<boolean> => {
+  const initializeBurnerWallet = async (
+    mode: BurnerInitMode,
+    seedOrPrivateKey?: string,
+    pin?: string
+  ): Promise<boolean> => {
     setError('');
     setInitializingBurner(true);
     setBurnerNeedsFunding(false);
 
     try {
-      const burnerRecord = await buildBurnerRecord(mode, seedOrPrivateKey);
-      saveBurnerWalletRecord(burnerRecord);
+      const burnerRecord = await buildBurnerRecord(mode, seedOrPrivateKey, pin);
+
+      const storageState = parseBurnerWalletStorageState();
+      const requiresEncryptedSave = mode !== 'stored' || storageState.kind === 'legacy';
+      const sessionPin = pin?.trim() ?? burnerPinRef.current;
+
+      if (requiresEncryptedSave) {
+        if (sessionPin.length < BURNER_PIN_MIN_LENGTH) {
+          throw new Error(`PIN must be at least ${BURNER_PIN_MIN_LENGTH} digits.`);
+        }
+        await saveEncryptedBurnerWalletRecord(burnerRecord, sessionPin);
+      }
+
+      if (sessionPin.length >= BURNER_PIN_MIN_LENGTH) {
+        burnerPinRef.current = sessionPin;
+      }
 
       const cotiEthers = await loadCotiEthersModule();
       const rpcProvider = await createCotiRpcProvider();
       const burnerWallet = new cotiEthers.Wallet(burnerRecord.privateKey, rpcProvider);
 
       burnerWalletRef.current = burnerWallet;
+      burnerRecordRef.current = burnerRecord;
       setWalletAddress(burnerWallet.address);
       setChainId(COTI_NETWORK.chainIdDecimal);
       setStatus('Connecting burner wallet...');
@@ -737,11 +930,127 @@ export default function App() {
     }
   };
 
-  const importBurnerWallet = async () => {
-    const imported = await initializeBurnerWallet('import', burnerImportInput);
-    if (imported) {
-      setShowBurnerImportModal(false);
+  const closeBurnerPinModal = () => {
+    if (initializingBurner) {
+      return;
     }
+
+    setShowBurnerPinModal(false);
+    setPendingBurnerInit(null);
+    setBurnerPinInput('');
+    setBurnerPinConfirmInput('');
+  };
+
+  const beginBurnerPinFlow = async (mode: BurnerInitMode, seedOrPrivateKey?: string) => {
+    setError('');
+
+    const storageState = parseBurnerWalletStorageState();
+    if (mode === 'stored' && storageState.kind === 'none') {
+      setError('No saved burner wallet found. Generate or import one first.');
+      return;
+    }
+
+    if (mode === 'stored' && storageState.kind === 'encrypted' && burnerPinRef.current) {
+      await initializeBurnerWallet('stored', undefined, burnerPinRef.current);
+      return;
+    }
+
+    const nextPinMode: BurnerPinMode = mode === 'stored' && storageState.kind === 'encrypted' ? 'unlock' : 'set';
+
+    setPendingBurnerInit({ mode, seedOrPrivateKey });
+    setBurnerPinMode(nextPinMode);
+    setBurnerPinInput('');
+    setBurnerPinConfirmInput('');
+    setShowBurnerPinModal(true);
+  };
+
+  const submitBurnerPinAndInitialize = async () => {
+    setError('');
+
+    const pending = pendingBurnerInit;
+    if (!pending) {
+      if (burnerPinMode !== 'set') {
+        return;
+      }
+
+      const pinForUpdate = burnerPinInput.trim();
+      const confirmForUpdate = burnerPinConfirmInput.trim();
+      if (pinForUpdate.length < BURNER_PIN_MIN_LENGTH) {
+        setError(`PIN must be at least ${BURNER_PIN_MIN_LENGTH} digits.`);
+        return;
+      }
+      if (confirmForUpdate !== pinForUpdate) {
+        setError('PIN confirmation does not match.');
+        return;
+      }
+
+      if (!burnerRecordRef.current) {
+        setError('Connect burner wallet first, then change PIN.');
+        return;
+      }
+
+      await saveEncryptedBurnerWalletRecord(burnerRecordRef.current, pinForUpdate);
+      burnerPinRef.current = pinForUpdate;
+      setShowBurnerPinModal(false);
+      setBurnerPinInput('');
+      setBurnerPinConfirmInput('');
+      setStatus('Burner PIN updated.');
+      return;
+    }
+
+    const pin = burnerPinInput.trim();
+    const minimumPinLength = burnerPinMode === 'unlock' ? LEGACY_BURNER_PIN_MIN_LENGTH : BURNER_PIN_MIN_LENGTH;
+    if (pin.length < minimumPinLength) {
+      setError(`PIN must be at least ${minimumPinLength} digits.`);
+      return;
+    }
+
+    if (burnerPinMode === 'set') {
+      const confirm = burnerPinConfirmInput.trim();
+      if (confirm !== pin) {
+        setError('PIN confirmation does not match.');
+        return;
+      }
+    }
+
+    const connected = await initializeBurnerWallet(pending.mode, pending.seedOrPrivateKey, pin);
+    if (connected) {
+      setShowBurnerPinModal(false);
+      setPendingBurnerInit(null);
+      setBurnerPinInput('');
+      setBurnerPinConfirmInput('');
+
+      if (pending.mode === 'import') {
+        setShowBurnerImportModal(false);
+      }
+
+      if (burnerPinMode === 'unlock' && pin.length < BURNER_PIN_MIN_LENGTH) {
+        setStatus(`Connected. Please update PIN to at least ${BURNER_PIN_MIN_LENGTH} digits.`);
+        setPendingBurnerInit(null);
+        setBurnerPinMode('set');
+        setBurnerPinInput('');
+        setBurnerPinConfirmInput('');
+        setShowBurnerPinModal(true);
+      }
+    }
+  };
+
+  const openChangeBurnerPin = () => {
+    if (!burnerRecordRef.current) {
+      setError('Connect burner wallet first, then change PIN.');
+      return;
+    }
+
+    setError('');
+    setPendingBurnerInit(null);
+    setBurnerPinMode('set');
+    setBurnerPinInput('');
+    setBurnerPinConfirmInput('');
+    setShowBurnerPinModal(true);
+  };
+
+  const importBurnerWallet = async () => {
+    await beginBurnerPinFlow('import', burnerImportInput);
   };
 
   const topUpBurnerWithMetaMask = async () => {
@@ -789,7 +1098,11 @@ export default function App() {
       setBurnerBalanceWei((previous) => (previous !== null ? previous + topUpAmount : previous));
       setTopUpMetricsNonce((previous) => previous + 1);
 
-      await initializeBurnerWallet('stored');
+      if (burnerPinRef.current) {
+        await initializeBurnerWallet('stored', undefined, burnerPinRef.current);
+      } else {
+        setStatus('Burner topped up. Unlock burner wallet to continue.');
+      }
     } catch (fundError) {
       const message = fundError instanceof Error ? fundError.message : 'Failed to top up burner wallet.';
       setError(message);
@@ -1019,6 +1332,7 @@ export default function App() {
     setError('');
 
     burnerWalletRef.current = null;
+    burnerRecordRef.current = null;
     setBurnerNeedsFunding(false);
 
     const provider = getConnectedProvider();
@@ -1041,6 +1355,7 @@ export default function App() {
     setOnboardStatus('Not onboarded');
     setSessionOnboardInfo({});
     setConnectedProvider(null);
+    burnerPinRef.current = '';
     signerCacheRef.current = {};
   };
 
@@ -1703,16 +2018,39 @@ export default function App() {
       <aside className="sidebar">
         <h1 className="title">COTI Chat</h1>
 
-        <button className="connect-btn" onClick={() => initializeBurnerWallet('generate')} type="button" disabled={initializingBurner}>
+        <button
+          className="connect-btn"
+          onClick={() => {
+            beginBurnerPinFlow('generate').catch(() => {});
+          }}
+          type="button"
+          disabled={initializingBurner}
+        >
           {initializingBurner ? 'Initializing Burner...' : 'Generate Burner Wallet'}
         </button>
 
-        <button className="connect-btn" onClick={() => initializeBurnerWallet('stored')} type="button" disabled={initializingBurner}>
+        <button
+          className="connect-btn"
+          onClick={() => {
+            beginBurnerPinFlow('stored').catch(() => {});
+          }}
+          type="button"
+          disabled={initializingBurner}
+        >
           Connect Burner Wallet
         </button>
 
         <button className="connect-btn" onClick={() => setShowBurnerImportModal(true)} type="button" disabled={initializingBurner}>
           Import Burner Wallet
+        </button>
+
+        <button
+          className="connect-btn"
+          onClick={openChangeBurnerPin}
+          type="button"
+          disabled={initializingBurner || !burnerRecordRef.current}
+        >
+          Change Burner PIN
         </button>
 
         <button className="connect-btn" onClick={topUpBurnerWithMetaMask} type="button" disabled={initializingBurner || !burnerAddress}>
@@ -1990,6 +2328,12 @@ export default function App() {
             <div className="chat-compose">
               <input
                 value={messageInput}
+                name="chat-message"
+                autoComplete="new-password"
+                data-form-type="other"
+                data-lpignore="true"
+                data-1p-ignore="true"
+                data-bwignore="true"
                 onChange={(event) => setMessageInput(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' && !event.shiftKey) {
@@ -2038,6 +2382,57 @@ export default function App() {
               </button>
               <button type="button" className="connect-btn" onClick={importBurnerWallet} disabled={initializingBurner}>
                 {initializingBurner ? 'Importing...' : 'Import'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {showBurnerPinModal ? (
+        <div className="modal-backdrop" onClick={closeBurnerPinModal}>
+          <div className="modal-card" onClick={(event) => event.stopPropagation()}>
+            <h3>{burnerPinMode === 'set' ? 'Set Burner PIN' : 'Unlock Burner Wallet'}</h3>
+            <input
+              value={burnerPinInput}
+              name={burnerPinMode === 'set' ? 'burner-pin-new' : 'burner-pin-unlock'}
+              autoComplete={burnerPinMode === 'set' ? 'new-password' : 'current-password'}
+              data-form-type="other"
+              data-lpignore="true"
+              data-1p-ignore="true"
+              data-bwignore="true"
+              onChange={(event) => setBurnerPinInput(event.target.value)}
+              placeholder={burnerPinMode === 'set' ? `Choose PIN (${BURNER_PIN_MIN_LENGTH}+ digits)` : 'Enter PIN'}
+              aria-label="Burner PIN"
+              type="password"
+            />
+            {burnerPinMode === 'set' ? (
+              <input
+                value={burnerPinConfirmInput}
+                name="burner-pin-confirm"
+                autoComplete="new-password"
+                data-form-type="other"
+                data-lpignore="true"
+                data-1p-ignore="true"
+                data-bwignore="true"
+                onChange={(event) => setBurnerPinConfirmInput(event.target.value)}
+                placeholder="Confirm PIN"
+                aria-label="Confirm burner PIN"
+                type="password"
+              />
+            ) : null}
+            <div className="modal-actions">
+              <button type="button" className="connect-btn" onClick={closeBurnerPinModal} disabled={initializingBurner}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="connect-btn"
+                onClick={() => {
+                  submitBurnerPinAndInitialize().catch(() => {});
+                }}
+                disabled={initializingBurner}
+              >
+                {initializingBurner ? 'Please wait...' : burnerPinMode === 'set' ? 'Save & Connect' : 'Unlock'}
               </button>
             </div>
           </div>
