@@ -1582,6 +1582,20 @@ export default function App() {
   }, [burnerAddress, topUpMultiplier, topUpMetricsNonce]);
 
   useEffect(() => {
+    if (!burnerAddress || !isWalletAddress(burnerAddress)) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      setTopUpMetricsNonce((previous) => previous + 1);
+    }, AUTO_SYNC_INTERVAL_MS);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [burnerAddress]);
+
+  useEffect(() => {
     if (!walletAddress || chainId !== COTI_NETWORK.chainIdDecimal) {
       return;
     }
