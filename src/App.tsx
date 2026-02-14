@@ -59,11 +59,11 @@ const COTI_NETWORK = {
   blockExplorerUrl: 'https://mainnet.cotiscan.io'
 };
 
-const MEMO_CONTRACT_ADDRESS = '0x817e3Fd031E3f964c2AEe6B3999365a979C8BB85';
+const MEMO_CONTRACT_ADDRESS = '0x81DEfBfba1cdc5AF972566342F4935853E02923d';
 const MEMO_CONTRACT_ABI = [
   'function submit(address recipient, ((uint256[] value), bytes[] signature) memo) payable',
   'function feeAmount() view returns (uint256)',
-  'event MemoSubmitted(address indexed recipient, address indexed from, ((uint256[] value) ciphertext, (uint256[] value) userCiphertext) memoForRecipient, ((uint256[] value) ciphertext, (uint256[] value) userCiphertext) memoForSender)'
+  'event MessageSubmitted(address indexed recipient, address indexed from, ((uint256[] value) ciphertext, (uint256[] value) userCiphertext) messageForRecipient, ((uint256[] value) ciphertext, (uint256[] value) userCiphertext) messageForSender)'
 ] as const;
 
 type CotiEthersModule = typeof import('@coti-io/coti-ethers');
@@ -754,8 +754,8 @@ export default function App() {
         return;
       }
 
-      const incomingFilter = contract.filters.MemoSubmitted(walletAddress, null);
-      const outgoingFilter = contract.filters.MemoSubmitted(null, walletAddress);
+      const incomingFilter = contract.filters.MessageSubmitted(walletAddress, null);
+      const outgoingFilter = contract.filters.MessageSubmitted(null, walletAddress);
 
       const [incomingLogs, outgoingLogs] = await Promise.all([
         contract.queryFilter(incomingFilter, fromBlock, latestBlock),
@@ -792,7 +792,7 @@ export default function App() {
 
         discoveredContacts.add(from);
 
-        const userCiphertext = extractUserCiphertext(args?.memoForRecipient);
+        const userCiphertext = extractUserCiphertext(args?.messageForRecipient);
         let messageText = '(Unable to decrypt message)';
         if (userCiphertext && userCiphertext.value.length > 0) {
           try {
@@ -824,7 +824,7 @@ export default function App() {
 
         discoveredContacts.add(recipient);
 
-        const userCiphertext = extractUserCiphertext(args?.memoForSender);
+        const userCiphertext = extractUserCiphertext(args?.messageForSender);
         let messageText = '(Unable to decrypt message)';
         if (userCiphertext && userCiphertext.value.length > 0) {
           try {
@@ -1070,26 +1070,26 @@ export default function App() {
         const cotiEthers = await loadCotiEthersModule();
         const contract = new cotiEthers.Contract(MEMO_CONTRACT_ADDRESS, MEMO_CONTRACT_ABI, signer);
 
-        const incomingFilter = contract.filters.MemoSubmitted(walletAddress, null);
-        const outgoingFilter = contract.filters.MemoSubmitted(null, walletAddress);
-        const handleMemoSubmitted = () => {
+        const incomingFilter = contract.filters.MessageSubmitted(walletAddress, null);
+        const outgoingFilter = contract.filters.MessageSubmitted(null, walletAddress);
+        const handleMessageSubmitted = () => {
           if (!cancelled) {
             syncConversationHistoryRef.current().catch(() => {});
           }
         };
 
-        contract.on(incomingFilter, handleMemoSubmitted);
-        contract.on(outgoingFilter, handleMemoSubmitted);
+        contract.on(incomingFilter, handleMessageSubmitted);
+        contract.on(outgoingFilter, handleMessageSubmitted);
 
         if (cancelled) {
-          contract.off(incomingFilter, handleMemoSubmitted);
-          contract.off(outgoingFilter, handleMemoSubmitted);
+          contract.off(incomingFilter, handleMessageSubmitted);
+          contract.off(outgoingFilter, handleMessageSubmitted);
           return;
         }
 
         unsubscribe = () => {
-          contract.off(incomingFilter, handleMemoSubmitted);
-          contract.off(outgoingFilter, handleMemoSubmitted);
+          contract.off(incomingFilter, handleMessageSubmitted);
+          contract.off(outgoingFilter, handleMessageSubmitted);
         };
       } catch {
       }
