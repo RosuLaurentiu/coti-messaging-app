@@ -61,7 +61,7 @@ const PROFILE_METADATA_PREFIX = '[nick:';
 const REPLY_METADATA_PREFIX = '[reply:';
 const LEGACY_PROFILE_PREFIX = '[[coti-profile:v1]]';
 const LEGACY_PROFILE_PLAIN_PREFIX = '[[coti-nick:v1]]';
-const MAX_REPLY_PREVIEW_LENGTH = 120;
+const MAX_REPLY_PREVIEW_LENGTH = 48;
 const COTI_WEI = 10n ** 18n;
 const MIN_BURNER_TOP_UP_WEI = 1_000_000_000_000_000n;
 
