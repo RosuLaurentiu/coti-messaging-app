@@ -59,9 +59,10 @@ const COTI_NETWORK = {
   blockExplorerUrl: 'https://mainnet.cotiscan.io'
 };
 
-const MEMO_CONTRACT_ADDRESS = '0xa354bFd7f53bE4972501633BA26F0423a7323ce0';
+const MEMO_CONTRACT_ADDRESS = '0x817e3Fd031E3f964c2AEe6B3999365a979C8BB85';
 const MEMO_CONTRACT_ABI = [
   'function submit(address recipient, ((uint256[] value), bytes[] signature) memo) payable',
+  'function feeAmount() view returns (uint256)',
   'event MemoSubmitted(address indexed recipient, address indexed from, ((uint256[] value) ciphertext, (uint256[] value) userCiphertext) memoForRecipient, ((uint256[] value) ciphertext, (uint256[] value) userCiphertext) memoForSender)'
 ] as const;
 
@@ -949,8 +950,9 @@ export default function App() {
       }
 
       const contract = new cotiEthers.Contract(MEMO_CONTRACT_ADDRESS, MEMO_CONTRACT_ABI, signer);
+      const requiredFee = (await contract.feeAmount()) as bigint;
       const memoTuple = [[encryptedMemo.ciphertext.value], encryptedMemo.signature] as const;
-      const tx = await contract.submit(activeContact, memoTuple, { value: 0n });
+      const tx = await contract.submit(activeContact, memoTuple, { value: requiredFee });
       await tx.wait();
 
       const nextOnboardInfo = signer.getUserOnboardInfo();
