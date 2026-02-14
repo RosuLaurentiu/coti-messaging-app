@@ -83,6 +83,19 @@ body {
   gap: 8px;
 }
 
+.wallet-meta input {
+  border: 1px solid #243142;
+  border-radius: 8px;
+  background: #0f1720;
+  color: #d9e1ea;
+  padding: 9px 10px;
+  font-size: 0.85rem;
+}
+
+.wallet-meta input:focus {
+  outline: 1px solid #3d5a80;
+}
+
 .meta-row {
   display: flex;
   justify-content: space-between;
@@ -107,6 +120,18 @@ body {
 
 .burner-address-btn:hover {
   color: #d9e1ea;
+}
+
+.profile-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.8rem;
+  color: #9eb0c4;
+}
+
+.profile-toggle input {
+  margin: 0;
 }
 
 .contact-form {

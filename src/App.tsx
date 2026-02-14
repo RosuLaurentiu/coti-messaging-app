@@ -44,11 +44,22 @@ type HistoryEntry = {
 const CONTACTS_STORAGE_KEY = 'coti-chat-contacts';
 const ACTIVE_CONTACT_STORAGE_KEY = 'coti-chat-active-contact';
 const BURNER_WALLET_STORAGE_KEY = 'coti-chat-burner-wallet';
+const PROFILE_STORAGE_KEY = 'coti-chat-profile';
+const PROFILE_SHARED_STORAGE_KEY = 'coti-chat-profile-shared';
 const AUTO_SYNC_INTERVAL_MS = 30000;
+const NICKNAME_DELIMITER = '\u001f';
+const LEGACY_PROFILE_PREFIX = '[[coti-profile:v1]]';
+const LEGACY_PROFILE_PLAIN_PREFIX = '[[coti-nick:v1]]';
+const COTI_WEI = 10n ** 18n;
+const MIN_BURNER_TOP_UP_WEI = 1_000_000_000_000_000n;
 
 type BurnerWalletRecord = {
   privateKey: string;
   mnemonic?: string;
+};
+
+type UserProfile = {
+  nickname: string;
 };
 
 type BurnerInitMode = 'generate' | 'import' | 'stored';
@@ -155,6 +166,11 @@ const normalizeContactName = (value: string): string | undefined => {
   return trimmed.length > 0 ? trimmed : undefined;
 };
 
+const scopedStorageKey = (baseKey: string, walletAddress?: string | null): string => {
+  const scope = walletAddress?.trim().toLowerCase();
+  return `${baseKey}:${scope && isWalletAddress(scope) ? scope : 'global'}`;
+};
+
 const normalizeChainId = (chainId: string | number): number => {
   if (typeof chainId === 'number') return chainId;
   return chainId.startsWith('0x') ? parseInt(chainId, 16) : Number(chainId);
@@ -208,6 +224,14 @@ const formatMessageTimestamp = (timestamp?: number): string => {
     hour: '2-digit',
     minute: '2-digit'
   });
+};
+
+const calculateTopUpAmount = (requiredFee: bigint): bigint => (requiredFee > 0n ? requiredFee * 20n : MIN_BURNER_TOP_UP_WEI);
+
+const formatCotiAmount = (weiAmount: bigint): string => {
+  const whole = weiAmount / COTI_WEI;
+  const fraction = (weiAmount % COTI_WEI).toString().padStart(18, '0').slice(0, 6).replace(/0+$/, '');
+  return fraction ? `${whole.toString()}.${fraction}` : whole.toString();
 };
 
 const toBigIntArray = (value: unknown): bigint[] => {
@@ -371,6 +395,118 @@ const saveBurnerWalletRecord = (record: BurnerWalletRecord): void => {
   window.localStorage.setItem(BURNER_WALLET_STORAGE_KEY, JSON.stringify(record));
 };
 
+const loadStoredProfile = (walletAddress?: string | null): UserProfile => {
+  try {
+    const raw = window.localStorage.getItem(scopedStorageKey(PROFILE_STORAGE_KEY, walletAddress));
+    if (!raw) {
+      return { nickname: '' };
+    }
+
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object') {
+      return { nickname: '' };
+    }
+
+    const record = parsed as { nickname?: unknown };
+    return {
+      nickname: typeof record.nickname === 'string' ? record.nickname : ''
+    };
+  } catch {
+    return { nickname: '' };
+  }
+};
+
+const loadSharedNicknameContacts = (walletAddress?: string | null): Record<string, boolean> => {
+  try {
+    const raw = window.localStorage.getItem(scopedStorageKey(PROFILE_SHARED_STORAGE_KEY, walletAddress));
+    if (!raw) {
+      return {};
+    }
+
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object') {
+      return {};
+    }
+
+    const result: Record<string, boolean> = {};
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof value === 'boolean') {
+        result[key.toLowerCase()] = value;
+      }
+    }
+
+    return result;
+  } catch {
+    return {};
+  }
+};
+
+const buildMessageWithProfilePayload = (plainText: string, nickname: string, shouldShare: boolean): string => {
+  const normalizedNickname = nickname
+    .replace(/\u001f/g, '')
+    .trim();
+  if (!shouldShare || !normalizedNickname) {
+    return plainText;
+  }
+
+  return `${NICKNAME_DELIMITER}${normalizedNickname}${NICKNAME_DELIMITER}: ${plainText}`;
+};
+
+const parseMessageProfilePayload = (text: string): { cleanText: string; nickname?: string } => {
+  if (text.startsWith(NICKNAME_DELIMITER)) {
+    const delimiterEnd = text.indexOf(NICKNAME_DELIMITER, NICKNAME_DELIMITER.length);
+    if (delimiterEnd < 0) {
+      return { cleanText: text };
+    }
+
+    const nicknameChunk = text.slice(NICKNAME_DELIMITER.length, delimiterEnd).trim();
+    const nickname = normalizeContactName(nicknameChunk)?.slice(0, 42);
+    const remainingRaw = text.slice(delimiterEnd + NICKNAME_DELIMITER.length);
+    const remaining = remainingRaw.startsWith(': ') ? remainingRaw.slice(2) : remainingRaw;
+    return {
+      cleanText: remaining,
+      nickname
+    };
+  }
+
+  if (text.startsWith(LEGACY_PROFILE_PLAIN_PREFIX)) {
+    const newlineIndex = text.indexOf('\n');
+    if (newlineIndex < 0) {
+      return { cleanText: text };
+    }
+
+    const nicknameChunk = text.slice(LEGACY_PROFILE_PLAIN_PREFIX.length, newlineIndex).trim();
+    const nickname = normalizeContactName(nicknameChunk)?.slice(0, 42);
+    const remaining = text.slice(newlineIndex + 1);
+    return {
+      cleanText: remaining,
+      nickname
+    };
+  }
+
+  if (!text.startsWith(LEGACY_PROFILE_PREFIX)) {
+    return { cleanText: text };
+  }
+
+  const newlineIndex = text.indexOf('\n');
+  if (newlineIndex < 0) {
+    return { cleanText: text };
+  }
+
+  const jsonChunk = text.slice(LEGACY_PROFILE_PREFIX.length, newlineIndex).trim();
+  const remaining = text.slice(newlineIndex + 1);
+  try {
+    const parsed = JSON.parse(jsonChunk) as { nick?: unknown };
+    const nickname = typeof parsed.nick === 'string' ? normalizeContactName(parsed.nick)?.slice(0, 42) : undefined;
+    return {
+      cleanText: remaining,
+      nickname
+    };
+  } catch {
+    return { cleanText: text };
+  }
+};
+
 export default function App() {
   const [contacts, setContacts] = useState<Contact[]>(() => loadStoredContacts());
   const [newContact, setNewContact] = useState('');
@@ -387,6 +523,8 @@ export default function App() {
   const [showBurnerImportModal, setShowBurnerImportModal] = useState(false);
   const [initializingBurner, setInitializingBurner] = useState(false);
   const [burnerNeedsFunding, setBurnerNeedsFunding] = useState(false);
+  const [myNickname, setMyNickname] = useState('');
+  const [sharedNicknameContacts, setSharedNicknameContacts] = useState<Record<string, boolean>>({});
   const [activeSignerSource, setActiveSignerSource] = useState<SignerSource>('burner');
   const [connectionMethod, setConnectionMethod] = useState<'metamask' | null>(null);
   const [connectingMethod, setConnectingMethod] = useState<'metamask' | null>(null);
@@ -396,6 +534,8 @@ export default function App() {
   const [messagesByContact, setMessagesByContact] = useState<Record<string, ChatMessage[]>>({});
   const [sending, setSending] = useState(false);
   const [syncingHistory, setSyncingHistory] = useState(false);
+  const [topUpAmountWei, setTopUpAmountWei] = useState<bigint | null>(null);
+  const [loadingTopUpQuote, setLoadingTopUpQuote] = useState(false);
   const [error, setError] = useState<string>('');
   const [activeProvider, setActiveProvider] = useState<Eip1193Provider | null>(null);
   const activeProviderRef = useRef<Eip1193Provider | null>(null);
@@ -610,12 +750,14 @@ export default function App() {
 
       const browserProvider = await createCotiBrowserProvider(provider);
       const funderSigner = await browserProvider.getSigner();
-      const cotiEthers = await loadCotiEthersModule();
-      const readProvider = await loadCotiReadProvider(true);
-      const readContract = new cotiEthers.Contract(CHAT_CONTRACT_ADDRESS, CHAT_CONTRACT_ABI, readProvider);
-      const requiredFee = (await readContract.feeAmount()) as bigint;
-      const minimumTopUp = 1_000_000_000_000_000n;
-      const topUpAmount = requiredFee > 0n ? requiredFee * 20n : minimumTopUp;
+      let topUpAmount = topUpAmountWei;
+      if (topUpAmount === null) {
+        const cotiEthers = await loadCotiEthersModule();
+        const readProvider = await loadCotiReadProvider(true);
+        const readContract = new cotiEthers.Contract(CHAT_CONTRACT_ADDRESS, CHAT_CONTRACT_ABI, readProvider);
+        const requiredFee = (await readContract.feeAmount()) as bigint;
+        topUpAmount = calculateTopUpAmount(requiredFee);
+      }
 
       const tx = await funderSigner.sendTransaction({
         to: burnerAddress,
@@ -790,6 +932,7 @@ export default function App() {
 
     const cacheKey = address.toLowerCase();
     const signer = await browserProvider.getSigner(address, sessionOnboardInfo[cacheKey]);
+    signer.disableAutoOnboard();
     signerCacheRef.current[cacheKey] = signer;
 
     await signer.generateOrRecoverAes();
@@ -893,21 +1036,29 @@ export default function App() {
       }
 
       const cacheKey = walletAddress.toLowerCase();
+      const cachedOnboardInfo = sessionOnboardInfo[cacheKey];
       let signer = signerCacheRef.current[cacheKey];
       if (!signer) {
         const browserProvider = await createCotiBrowserProvider(provider);
-        signer = await browserProvider.getSigner(walletAddress, sessionOnboardInfo[cacheKey]);
+        signer = await browserProvider.getSigner(walletAddress, cachedOnboardInfo);
+        signer.disableAutoOnboard();
         signerCacheRef.current[cacheKey] = signer;
+      } else if (cachedOnboardInfo) {
+        signer.setUserOnboardInfo(cachedOnboardInfo);
       }
+
+      signer.disableAutoOnboard();
 
       let onboardInfo = signer.getUserOnboardInfo();
       if (!onboardInfo?.aesKey) {
-        await signer.generateOrRecoverAes();
-        onboardInfo = signer.getUserOnboardInfo();
+        if (cachedOnboardInfo) {
+          signer.setUserOnboardInfo(cachedOnboardInfo);
+          onboardInfo = signer.getUserOnboardInfo();
+        }
       }
 
       if (!onboardInfo?.aesKey) {
-        throw new Error('AES key unavailable in this session. Please sign to enable encryption.');
+        throw new Error('AES key unavailable. Use Connect without burner and complete onboarding signature once.');
       }
 
       setSessionOnboardInfo((previous) => ({
@@ -1005,6 +1156,7 @@ export default function App() {
       );
 
       const discoveredContacts = new Set<string>();
+      const discoveredNicknames = new Map<string, string>();
       const entries: HistoryEntry[] = [];
 
       for (const log of incomingLogs) {
@@ -1022,7 +1174,11 @@ export default function App() {
           try {
             const decrypted = await signer.decryptValue(userCiphertext as never);
             const raw = typeof decrypted === 'string' ? decrypted : decrypted.toString();
-            messageText = decodeMemoPlaintext(raw);
+            const parsed = parseMessageProfilePayload(decodeMemoPlaintext(raw));
+            messageText = parsed.cleanText;
+            if (parsed.nickname) {
+              discoveredNicknames.set(from.toLowerCase(), parsed.nickname);
+            }
           } catch {
             messageText = '(Unable to decrypt message)';
           }
@@ -1054,7 +1210,8 @@ export default function App() {
           try {
             const decrypted = await signer.decryptValue(userCiphertext as never);
             const raw = typeof decrypted === 'string' ? decrypted : decrypted.toString();
-            messageText = decodeMemoPlaintext(raw);
+            const parsed = parseMessageProfilePayload(decodeMemoPlaintext(raw));
+            messageText = parsed.cleanText;
           } catch {
             messageText = '(Unable to decrypt message)';
           }
@@ -1084,13 +1241,21 @@ export default function App() {
         }
 
         const next: Record<string, ChatMessage[]> = { ...previous };
+        const existingIdsByContact = new Map<string, Set<string>>();
         for (const entry of entries) {
           const key = entry.contact.toLowerCase();
           const existing = next[key] ?? [];
+          let existingIds = existingIdsByContact.get(key);
+          if (!existingIds) {
+            existingIds = new Set(existing.map((message) => message.id));
+            existingIdsByContact.set(key, existingIds);
+          }
 
-          if (existing.some((message) => message.id === entry.id)) {
+          if (existingIds.has(entry.id)) {
             continue;
           }
+
+          existingIds.add(entry.id);
 
           next[key] = [
             ...existing,
@@ -1105,7 +1270,29 @@ export default function App() {
 
         return next;
       });
-      setContacts((previous) => mergeUniqueContacts(previous, Array.from(discoveredContacts)));
+      setContacts((previous) => {
+        const mergedContacts = mergeUniqueContacts(previous, Array.from(discoveredContacts));
+
+        if (discoveredNicknames.size === 0) {
+          return mergedContacts;
+        }
+
+        return mergedContacts.map((contact) => {
+          if (contact.name) {
+            return contact;
+          }
+
+          const nickname = discoveredNicknames.get(contact.address.toLowerCase());
+          if (!nickname) {
+            return contact;
+          }
+
+          return {
+            ...contact,
+            name: nickname
+          };
+        });
+      });
       lastSyncedBlockRef.current[walletKey] = latestBlock;
 
       if (!activeContact && discoveredContacts.size > 0) {
@@ -1160,30 +1347,51 @@ export default function App() {
         throw new Error('Unable to resolve submit selector.');
       }
 
-      const encodedMemo = encodeMemoPlaintext(plainText);
-      const encryptedMemo = await signer.encryptValue(encodedMemo, CHAT_CONTRACT_ADDRESS, selector);
-      if (
-        typeof encryptedMemo !== 'object' ||
-        encryptedMemo === null ||
-        typeof encryptedMemo.ciphertext !== 'object' ||
-        encryptedMemo.ciphertext === null ||
-        !('value' in encryptedMemo.ciphertext) ||
-        !Array.isArray(encryptedMemo.signature)
-      ) {
-        throw new Error('Encrypted memo format mismatch for submit().');
-      }
-
       const contract = new cotiEthers.Contract(CHAT_CONTRACT_ADDRESS, CHAT_CONTRACT_ABI, signer);
       const requiredFee = (await contract.feeAmount()) as bigint;
-      const memoTuple = [[encryptedMemo.ciphertext.value], encryptedMemo.signature] as const;
-      const tx = await contract.submit(activeContact, memoTuple, { value: requiredFee });
-      await tx.wait();
+
+      const contactKey = activeContact.toLowerCase();
+      const shouldShareProfile = Boolean(myNickname.trim()) && !sharedNicknameContacts[contactKey];
+      const sendEncryptedMemo = async (textToSend: string): Promise<void> => {
+        const encodedMemo = encodeMemoPlaintext(textToSend);
+        const encryptedMemo = await signer.encryptValue(encodedMemo, CHAT_CONTRACT_ADDRESS, selector);
+        if (
+          typeof encryptedMemo !== 'object' ||
+          encryptedMemo === null ||
+          typeof encryptedMemo.ciphertext !== 'object' ||
+          encryptedMemo.ciphertext === null ||
+          !('value' in encryptedMemo.ciphertext) ||
+          !Array.isArray(encryptedMemo.signature)
+        ) {
+          throw new Error('Encrypted memo format mismatch for submit().');
+        }
+
+        const memoTuple = [[encryptedMemo.ciphertext.value], encryptedMemo.signature] as const;
+        const tx = await contract.submit(activeContact, memoTuple, { value: requiredFee });
+        await tx.wait();
+      };
+
+      let sentWithProfile = false;
+      if (shouldShareProfile) {
+        const plainTextWithProfile = buildMessageWithProfilePayload(plainText, myNickname, true);
+        await sendEncryptedMemo(plainTextWithProfile);
+        sentWithProfile = true;
+      } else {
+        await sendEncryptedMemo(plainText);
+      }
 
       const nextOnboardInfo = signer.getUserOnboardInfo();
       setSessionOnboardInfo((previous) => ({
         ...previous,
         [cacheKey]: mergeOnboardInfo(previous[cacheKey], nextOnboardInfo)
       }));
+
+      if (sentWithProfile) {
+        setSharedNicknameContacts((previous) => ({
+          ...previous,
+          [contactKey]: true
+        }));
+      }
 
       setMessageInput('');
       await syncConversationHistory();
@@ -1205,6 +1413,32 @@ export default function App() {
     } catch {
     }
   }, [contacts]);
+
+  useEffect(() => {
+    const scopedProfile = loadStoredProfile(walletAddress);
+    setMyNickname(scopedProfile.nickname);
+    setSharedNicknameContacts(loadSharedNicknameContacts(walletAddress));
+  }, [walletAddress]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        scopedStorageKey(PROFILE_STORAGE_KEY, walletAddress),
+        JSON.stringify({ nickname: myNickname })
+      );
+    } catch {
+    }
+  }, [walletAddress, myNickname]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        scopedStorageKey(PROFILE_SHARED_STORAGE_KEY, walletAddress),
+        JSON.stringify(sharedNicknameContacts)
+      );
+    } catch {
+    }
+  }, [walletAddress, sharedNicknameContacts]);
 
   useEffect(() => {
     if (!contacts.length) {
@@ -1264,6 +1498,43 @@ export default function App() {
       setMessagesByContact({});
     }
   }, [walletAddress]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!burnerAddress || !isWalletAddress(burnerAddress)) {
+      setTopUpAmountWei(null);
+      setLoadingTopUpQuote(false);
+      return;
+    }
+
+    const loadTopUpAmount = async () => {
+      setLoadingTopUpQuote(true);
+      try {
+        const cotiEthers = await loadCotiEthersModule();
+        const readProvider = await loadCotiReadProvider(true);
+        const readContract = new cotiEthers.Contract(CHAT_CONTRACT_ADDRESS, CHAT_CONTRACT_ABI, readProvider);
+        const requiredFee = (await readContract.feeAmount()) as bigint;
+        if (!cancelled) {
+          setTopUpAmountWei(calculateTopUpAmount(requiredFee));
+        }
+      } catch {
+        if (!cancelled) {
+          setTopUpAmountWei(null);
+        }
+      } finally {
+        if (!cancelled) {
+          setLoadingTopUpQuote(false);
+        }
+      }
+    };
+
+    loadTopUpAmount().catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, [burnerAddress]);
 
   useEffect(() => {
     if (!walletAddress || chainId !== COTI_NETWORK.chainIdDecimal) {
@@ -1388,6 +1659,18 @@ export default function App() {
         <button className="connect-btn" onClick={topUpBurnerWithMetaMask} type="button" disabled={initializingBurner || !burnerAddress}>
           Top Up Burner (MetaMask)
         </button>
+        <div className="wallet-meta">
+          <div className="meta-row">
+            <span>Top up amount</span>
+            <strong>
+              {loadingTopUpQuote
+                ? 'Calculating...'
+                : topUpAmountWei !== null
+                  ? `${formatCotiAmount(topUpAmountWei)} COTI`
+                  : '—'}
+            </strong>
+          </div>
+        </div>
 
         <div className="wallet-meta">
           <div className="meta-row">
@@ -1405,6 +1688,18 @@ export default function App() {
               <strong>—</strong>
             )}
           </div>
+        </div>
+
+        <div className="wallet-meta">
+          <div className="meta-row">
+            <span>My nickname</span>
+          </div>
+          <input
+            value={myNickname}
+            onChange={(event) => setMyNickname(event.target.value.slice(0, 42))}
+            placeholder="Choose nickname"
+            aria-label="My nickname"
+          />
         </div>
 
         {burnerNeedsFunding ? <p className="error">Burner needs funding before onboarding.</p> : null}
@@ -1602,6 +1897,12 @@ export default function App() {
               <input
                 value={messageInput}
                 onChange={(event) => setMessageInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault();
+                    sendMessage().catch(() => {});
+                  }
+                }}
                 placeholder="Type a private message"
                 aria-label="Message"
               />
