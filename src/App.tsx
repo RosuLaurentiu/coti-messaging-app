@@ -68,8 +68,13 @@ const CHAT_CONTRACT_ABI = [
 
 type CotiEthersModule = typeof import('@coti-io/coti-ethers');
 type WalletConnectProviderModule = typeof import('@walletconnect/ethereum-provider');
+type CotiWsProvider = InstanceType<CotiEthersModule['WebSocketProvider']>;
+type CotiHttpProvider = InstanceType<CotiEthersModule['JsonRpcProvider']>;
+type CotiReadProvider = CotiWsProvider | CotiHttpProvider;
 let cotiEthersModulePromise: Promise<CotiEthersModule> | null = null;
 let walletConnectModulePromise: Promise<WalletConnectProviderModule> | null = null;
+let cotiWsProviderPromise: Promise<CotiWsProvider> | null = null;
+let cotiHttpProviderPromise: Promise<CotiHttpProvider> | null = null;
 
 const WALLETCONNECT_PROJECT_ID = import.meta.env.VITE_WALLETCONNECT_PROJECT_ID as string | undefined;
 
@@ -87,6 +92,62 @@ const loadWalletConnectProviderModule = (): Promise<WalletConnectProviderModule>
   }
 
   return walletConnectModulePromise;
+};
+
+const loadCotiWsProvider = async (): Promise<CotiWsProvider> => {
+  if (!cotiWsProviderPromise) {
+    cotiWsProviderPromise = loadCotiEthersModule().then((cotiEthers) =>
+      new cotiEthers.WebSocketProvider(COTI_NETWORK.wsUrl, {
+        name: COTI_NETWORK.chainName,
+        chainId: COTI_NETWORK.chainIdDecimal
+      })
+    );
+  }
+
+  return cotiWsProviderPromise;
+};
+
+const loadCotiHttpProvider = async (): Promise<CotiHttpProvider> => {
+  if (!cotiHttpProviderPromise) {
+    cotiHttpProviderPromise = loadCotiEthersModule().then(
+      (cotiEthers) =>
+        new cotiEthers.JsonRpcProvider(COTI_NETWORK.rpcUrl, {
+          name: COTI_NETWORK.chainName,
+          chainId: COTI_NETWORK.chainIdDecimal
+        })
+    );
+  }
+
+  return cotiHttpProviderPromise;
+};
+
+const resetCotiWsProvider = async (): Promise<void> => {
+  if (!cotiWsProviderPromise) {
+    return;
+  }
+
+  try {
+    const wsProvider = await cotiWsProviderPromise;
+    const providerWithDestroy = wsProvider as unknown as { destroy?: () => void };
+    providerWithDestroy.destroy?.();
+  } catch {
+  } finally {
+    cotiWsProviderPromise = null;
+  }
+};
+
+const loadCotiReadProvider = async (preferWebSocket = true): Promise<CotiReadProvider> => {
+  if (preferWebSocket) {
+    try {
+      const wsProvider = await loadCotiWsProvider();
+      await wsProvider.getBlockNumber();
+      return wsProvider;
+    } catch {
+      await resetCotiWsProvider();
+    }
+  }
+
+  return loadCotiHttpProvider();
 };
 
 const shortenAddress = (address: string): string => `${address.slice(0, 6)}...${address.slice(-4)}`;
@@ -743,8 +804,9 @@ export default function App() {
       setSyncingHistory(true);
       const { signer, cacheKey } = await getMemoSigner();
       const cotiEthers = await loadCotiEthersModule();
-      const contract = new cotiEthers.Contract(CHAT_CONTRACT_ADDRESS, CHAT_CONTRACT_ABI, signer);
-      const latestBlock = await signer.provider.getBlockNumber();
+      const readProvider = await loadCotiReadProvider(true);
+      const contract = new cotiEthers.Contract(CHAT_CONTRACT_ADDRESS, CHAT_CONTRACT_ABI, readProvider);
+      const latestBlock = await readProvider.getBlockNumber();
 
       const walletKey = walletAddress.toLowerCase();
       const lastSyncedBlock = lastSyncedBlockRef.current[walletKey];
@@ -773,7 +835,7 @@ export default function App() {
       const blockTimestampMap = new Map<number, number>();
       await Promise.all(
         Array.from(blockNumbers).map(async (blockNumber) => {
-          const block = await signer.provider.getBlock(blockNumber);
+          const block = await readProvider.getBlock(blockNumber);
           if (block?.timestamp) {
             blockTimestampMap.set(blockNumber, Number(block.timestamp));
           }
@@ -1052,9 +1114,7 @@ export default function App() {
 
     let cancelled = false;
     let unsubscribe: (() => void) | null = null;
-    const intervalId = window.setInterval(() => {
-      syncConversationHistoryRef.current().catch(() => {});
-    }, AUTO_SYNC_INTERVAL_MS);
+    let pollIntervalId: number | null = null;
 
     const setupRealtimeSubscription = async () => {
       try {
@@ -1062,13 +1122,10 @@ export default function App() {
           return;
         }
 
-        const { signer } = await getMemoSigner();
-        if (cancelled) {
-          return;
-        }
-
         const cotiEthers = await loadCotiEthersModule();
-        const contract = new cotiEthers.Contract(CHAT_CONTRACT_ADDRESS, CHAT_CONTRACT_ABI, signer);
+        const wsProvider = await loadCotiWsProvider();
+        await wsProvider.getBlockNumber();
+        const contract = new cotiEthers.Contract(CHAT_CONTRACT_ADDRESS, CHAT_CONTRACT_ABI, wsProvider);
 
         const incomingFilter = contract.filters.MessageSubmitted(walletAddress, null);
         const outgoingFilter = contract.filters.MessageSubmitted(null, walletAddress);
@@ -1092,6 +1149,12 @@ export default function App() {
           contract.off(outgoingFilter, handleMessageSubmitted);
         };
       } catch {
+        await resetCotiWsProvider();
+        if (!cancelled) {
+          pollIntervalId = window.setInterval(() => {
+            syncConversationHistoryRef.current().catch(() => {});
+          }, AUTO_SYNC_INTERVAL_MS);
+        }
       }
     };
 
@@ -1100,7 +1163,9 @@ export default function App() {
 
     return () => {
       cancelled = true;
-      window.clearInterval(intervalId);
+      if (pollIntervalId !== null) {
+        window.clearInterval(pollIntervalId);
+      }
       unsubscribe?.();
     };
   }, [walletAddress, chainId, hasAesReady]);
